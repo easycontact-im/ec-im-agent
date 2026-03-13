@@ -30,10 +30,10 @@ SERVICE_NAME="easyalert-agent"
 CONFIG_DIR="/etc/easyalert"
 VAULT_DIR="/var/lib/easyalert"
 
-# ── Defaults ─────────────────────────────────────────────────
-API_URL=""
-API_KEY=""
-AGENT_NAME=""
+# ── Defaults (env vars supported for frontend-generated scripts) ──
+API_URL="${AGENT_API_URL:-}"
+API_KEY="${AGENT_API_KEY:-}"
+AGENT_NAME="${AGENT_NAME:-}"
 VERSION="latest"
 INSTALL_DIR="/opt/easyalert/agent"
 DO_UNINSTALL=false
