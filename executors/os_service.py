@@ -14,6 +14,14 @@ logger = logging.getLogger("ec-im-agent.executors.os_service")
 
 DEFAULT_SERVICE_TIMEOUT = 60
 MAX_OUTPUT_SIZE = 1_048_576  # 1 MB
+MAX_SHUTDOWN_DELAY_SECONDS = 86400  # 1 day
+
+ALLOWED_EXECUTABLES = frozenset({
+    "systemctl",
+    "sc.exe",
+    "service",
+    "shutdown",
+})
 
 # Slightly more permissive for systemd unit names (allows @ and :)
 _SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@:\-]{0,252}$")
@@ -106,6 +114,17 @@ class OSServiceExecutor(BaseExecutor):
             Result dict with stdout/stderr output.
         """
         start = time.monotonic_ns()
+
+        # H6: Validate that the executable is in the allowed whitelist
+        if cmd[0] not in ALLOWED_EXECUTABLES:
+            logger.error("Blocked execution of disallowed command: %s", cmd[0])
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"Command '{cmd[0]}' is not in the allowed executables list",
+                "exitCode": -1,
+                "durationMs": 0,
+            }
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -320,6 +339,15 @@ class OSServiceExecutor(BaseExecutor):
                 delay_seconds = 0
         except (ValueError, TypeError):
             delay_seconds = 0
+
+        if delay_seconds > MAX_SHUTDOWN_DELAY_SECONDS:
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"Shutdown delay {delay_seconds}s exceeds maximum allowed ({MAX_SHUTDOWN_DELAY_SECONDS}s / 1 day)",
+                "exitCode": -1,
+                "durationMs": 0,
+            }
 
         if self._is_windows():
             cmd = ["shutdown", "/r", "/t", str(delay_seconds)]

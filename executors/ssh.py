@@ -107,12 +107,17 @@ class SSHExecutor(BaseExecutor):
         known_hosts: str | None = None
         if "knownHostsPath" in credentials:
             raw_path = credentials["knownHostsPath"]
-            # Validate path: no traversal, must be absolute, no symlink tricks
-            real_path = os.path.realpath(raw_path)
+            # Validate path: no traversal, must be absolute, must exist, no symlink tricks
             if ".." in raw_path or not os.path.isabs(raw_path):
                 raise ConnectionError(
                     f"Invalid knownHostsPath: must be an absolute path without '..' segments"
                 )
+            if not os.path.exists(raw_path):
+                raise ConnectionError(
+                    f"knownHostsPath '{raw_path}' does not exist. "
+                    "Provide a valid known_hosts file path or set strictHostKeyChecking to false."
+                )
+            real_path = os.path.realpath(raw_path)
             if real_path != raw_path and os.path.islink(raw_path):
                 raise ConnectionError(
                     f"knownHostsPath '{raw_path}' is a symlink (resolves to '{real_path}'). "
@@ -126,7 +131,7 @@ class SSHExecutor(BaseExecutor):
             o_nofollow = getattr(os, 'O_NOFOLLOW', 0)
             if o_nofollow:
                 try:
-                    fd = os.open(real_path, os.O_RDONLY | o_nofollow)
+                    fd = os.open(raw_path, os.O_RDONLY | o_nofollow)
                     os.close(fd)
                 except OSError as exc:
                     raise ConnectionError(
@@ -146,8 +151,8 @@ class SSHExecutor(BaseExecutor):
                     raw_path,
                 )
             known_hosts = real_path
-        elif credentials.get("strictHostKeyChecking") is False:
-            known_hosts = None  # Explicit opt-out
+        elif credentials.get("strictHostKeyChecking", True) is False:
+            known_hosts = None  # Explicit opt-out of host key checking
         else:
             # Default to system known_hosts if it exists
             system_known_hosts = Path.home() / ".ssh" / "known_hosts"

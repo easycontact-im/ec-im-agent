@@ -14,6 +14,7 @@ logger = logging.getLogger("ec-im-agent.executors.email")
 
 DEFAULT_TIMEOUT = 30
 DEFAULT_SMTP_PORT = 587
+IMPLICIT_SSL_PORT = 465
 
 
 class EmailExecutor(BaseExecutor):
@@ -23,13 +24,14 @@ class EmailExecutor(BaseExecutor):
     - sendEmail: Send an email to one or more recipients.
     - testConnection: Test SMTP connectivity and authentication.
 
-    Credentials (from vault):
-    - host: SMTP server hostname (e.g., smtp.gmail.com)
-    - port: SMTP server port (default: 587)
+    Credentials (from vault — merged config + secrets):
+    - smtpHost: SMTP server hostname (e.g., smtp.gmail.com)
+    - smtpPort: SMTP server port (default: 587)
     - username: SMTP username / email address
     - password: SMTP password or app-specific password
-    - useTLS: Whether to use STARTTLS (default: true)
-    - fromName: Display name for the sender (optional)
+    - security: Encryption mode — "none", "starttls", or "ssl" (new)
+    - useTls: Legacy boolean (backward compat — prefer security)
+    - fromAddress: Sender email address (optional, falls back to username)
     """
 
     async def execute(
@@ -74,6 +76,42 @@ class EmailExecutor(BaseExecutor):
             return None
         return self.vault.get_credential(connection_id)
 
+    @staticmethod
+    def _resolve_tls_params(
+        port: int, use_tls: bool, security: str | None = None
+    ) -> dict[str, bool]:
+        """Return the correct aiosmtplib TLS keyword arguments.
+
+        When the new ``security`` field is present, it is used directly:
+        - ``ssl``: implicit SSL (``use_tls=True``)
+        - ``starttls``: STARTTLS upgrade (``start_tls=True``)
+        - ``none``: no encryption
+
+        Falls back to legacy ``use_tls`` boolean with port-based detection.
+
+        Args:
+            port: SMTP server port.
+            use_tls: Legacy boolean — whether TLS is enabled.
+            security: New explicit mode: ``"none"`` | ``"starttls"`` | ``"ssl"``.
+
+        Returns:
+            Dict with ``use_tls`` and ``start_tls`` keys for aiosmtplib.
+        """
+        if security is not None:
+            if security == "ssl":
+                return {"use_tls": True, "start_tls": False}
+            elif security == "starttls":
+                return {"use_tls": False, "start_tls": True}
+            else:  # "none"
+                return {"use_tls": False, "start_tls": False}
+
+        # Legacy fallback
+        if not use_tls:
+            return {"use_tls": False, "start_tls": False}
+        if port == IMPLICIT_SSL_PORT:
+            return {"use_tls": True, "start_tls": False}
+        return {"use_tls": False, "start_tls": True}
+
     async def _send_email(
         self, connection_id: str | None, params: dict[str, Any]
     ) -> dict[str, Any]:
@@ -97,12 +135,14 @@ class EmailExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-        host = config.get("host", "")
-        port = int(config.get("port", DEFAULT_SMTP_PORT))
+        host = config.get("smtpHost", "") or config.get("host", "")
+        port = int(config.get("smtpPort", 0) or config.get("port", DEFAULT_SMTP_PORT))
         username = config.get("username", "")
         password = config.get("password", "")
-        use_tls = config.get("useTLS", True)
+        security = config.get("security")  # New explicit mode
+        use_tls = config.get("useTls", config.get("useTLS", True))  # Legacy fallback
         from_name = config.get("fromName", "")
+        from_address = config.get("fromAddress", "")
 
         to_addrs = params.get("to", "")
         subject = params.get("subject", "")
@@ -143,7 +183,8 @@ class EmailExecutor(BaseExecutor):
         try:
             # Build MIME message
             msg = MIMEMultipart("alternative")
-            from_addr = f"{from_name} <{username}>" if from_name else username
+            sender = from_address or username
+            from_addr = f"{from_name} <{sender}>" if from_name else sender
             msg["From"] = from_addr
             msg["To"] = to_addrs
             msg["Subject"] = subject or "(no subject)"
@@ -167,13 +208,14 @@ class EmailExecutor(BaseExecutor):
                     )
 
             # Send via aiosmtplib
+            tls_params = self._resolve_tls_params(port, use_tls, security=security)
             await aiosmtplib.send(
                 msg,
                 hostname=host,
                 port=port,
                 username=username,
                 password=password,
-                start_tls=use_tls,
+                **tls_params,
                 recipients=all_recipients,
                 timeout=DEFAULT_TIMEOUT,
             )
@@ -236,11 +278,15 @@ class EmailExecutor(BaseExecutor):
     async def _test_connection(
         self, connection_id: str | None, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Test SMTP connectivity by authenticating to the server.
+        """Test SMTP connectivity, optionally sending a real test email.
+
+        If ``params`` contains a ``targetEmail`` key, a real test email is sent
+        to that address. Otherwise, only SMTP connectivity is verified (connect,
+        STARTTLS, login, quit).
 
         Args:
             connection_id: Connection ID for vault credential lookup.
-            params: Unused, present for interface consistency.
+            params: May contain ``targetEmail`` for sending a real test email.
 
         Returns:
             Result dict confirming the SMTP connection is valid.
@@ -255,22 +301,28 @@ class EmailExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-        host = config.get("host", "")
-        port = int(config.get("port", DEFAULT_SMTP_PORT))
+        host = config.get("smtpHost", "") or config.get("host", "")
+        port = int(config.get("smtpPort", 0) or config.get("port", DEFAULT_SMTP_PORT))
         username = config.get("username", "")
         password = config.get("password", "")
-        use_tls = config.get("useTLS", True)
+        security = config.get("security")  # New explicit mode
+        use_tls = config.get("useTls", config.get("useTLS", True))  # Legacy fallback
+
+        target_email = params.get("targetEmail")
+
+        if target_email:
+            return await self._send_test_email(config, target_email)
 
         start = time.monotonic_ns()
         try:
+            tls_params = self._resolve_tls_params(port, use_tls, security=security)
             smtp = aiosmtplib.SMTP(
                 hostname=host,
                 port=port,
                 timeout=DEFAULT_TIMEOUT,
+                **tls_params,
             )
             await smtp.connect()
-            if use_tls:
-                await smtp.starttls()
             await smtp.login(username, password)
             await smtp.quit()
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
@@ -301,6 +353,108 @@ class EmailExecutor(BaseExecutor):
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
             logger.error("SMTP testConnection failed for connection %s: %s", connection_id, exc)
+            return {
+                "status": "error",
+                "output": None,
+                "error": str(exc),
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }
+
+    async def _send_test_email(
+        self, config: dict[str, Any], target_email: str
+    ) -> dict[str, Any]:
+        """Send a real test email to verify end-to-end delivery.
+
+        Args:
+            config: SMTP configuration from vault.
+            target_email: Recipient email address.
+
+        Returns:
+            Result dict confirming the test email was sent.
+        """
+        host = config.get("smtpHost", "") or config.get("host", "")
+        port = int(config.get("smtpPort", 0) or config.get("port", DEFAULT_SMTP_PORT))
+        username = config.get("username", "")
+        password = config.get("password", "")
+        security = config.get("security")  # New explicit mode
+        use_tls = config.get("useTls", config.get("useTLS", True))  # Legacy fallback
+        from_name = config.get("fromName", "")
+        from_address = config.get("fromAddress", "") or username
+
+        start = time.monotonic_ns()
+        try:
+            msg = MIMEMultipart("alternative")
+            sender = from_address
+            from_header = f"{from_name} <{sender}>" if from_name else sender
+            msg["From"] = from_header
+            msg["To"] = target_email
+            msg["Subject"] = "[EasyAlert] Test Email"
+
+            body = (
+                "This is a test email from EasyAlert automation.\n\n"
+                "If you received this message, your email connection is configured correctly."
+            )
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+            tls_params = self._resolve_tls_params(port, use_tls, security=security)
+            await aiosmtplib.send(
+                msg,
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                **tls_params,
+                recipients=[target_email],
+                timeout=DEFAULT_TIMEOUT,
+            )
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+
+            return {
+                "status": "success",
+                "output": {
+                    "to": target_email,
+                    "subject": "[EasyAlert] Test Email",
+                    "message": f"Test email sent to {target_email}",
+                },
+                "error": None,
+                "exitCode": 0,
+                "durationMs": duration_ms,
+            }
+
+        except aiosmtplib.SMTPAuthenticationError as exc:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error("SMTP auth failed during test email: %s", exc)
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"SMTP authentication failed: {exc}",
+                "exitCode": 1,
+                "durationMs": duration_ms,
+            }
+        except aiosmtplib.SMTPConnectError as exc:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error("SMTP connection failed during test email: %s", exc)
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"SMTP connection failed: {exc}",
+                "exitCode": 1,
+                "durationMs": duration_ms,
+            }
+        except TimeoutError:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error("SMTP test email timed out")
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"SMTP request timed out after {DEFAULT_TIMEOUT}s",
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }
+        except Exception as exc:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error("Test email failed: %s", exc)
             return {
                 "status": "error",
                 "output": None,

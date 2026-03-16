@@ -50,6 +50,12 @@ async def heartbeat_loop(
         except Exception as exc:
             logger.warning("Heartbeat failed: %s", exc)
 
+        # Flush queued results when connectivity is restored
+        try:
+            await client.retry_queued_results()
+        except Exception as exc:
+            logger.warning("Queued result retry failed: %s", exc)
+
         try:
             await asyncio.wait_for(
                 shutdown_event.wait(),
@@ -195,7 +201,12 @@ async def run() -> None:
     vault = Vault(settings.VAULT_PATH, settings.AGENT_API_KEY)
 
     # Initialize worker
-    worker = Worker(vault, settings.MAX_CONCURRENT_JOBS)
+    # TLS required for credential storage, but localhost is safe (no network transit)
+    from urllib.parse import urlparse
+    parsed_url = urlparse(settings.AGENT_API_URL)
+    is_loopback = parsed_url.hostname in ("localhost", "127.0.0.1", "::1")
+    is_tls = settings.AGENT_API_URL.startswith("https://") or is_loopback
+    worker = Worker(vault, settings.MAX_CONCURRENT_JOBS, is_tls=is_tls)
 
     # Initialize admin server
     admin = AdminServer(vault, settings.ADMIN_PORT, admin_token=settings.ADMIN_TOKEN)
@@ -264,6 +275,12 @@ async def run() -> None:
                     "%d in-flight job(s) did not complete within %.0fs grace period",
                     len(inflight_tasks), SHUTDOWN_GRACE_PERIOD,
                 )
+
+        # Flush any queued results before going offline
+        try:
+            await client.retry_queued_results()
+        except Exception as exc:
+            logger.warning("Failed to flush queued results on shutdown: %s", exc)
 
         # Notify central API that agent is going offline
         try:

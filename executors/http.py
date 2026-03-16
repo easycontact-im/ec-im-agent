@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import ipaddress
+import json
 import logging
 import socket
 import time
@@ -91,7 +92,7 @@ class HTTPExecutor(BaseExecutor):
             Result dict indicating connection success or failure.
         """
         config = params.get("connectionConfig", {})
-        url = config.get("url") or config.get("host", "")
+        url = config.get("baseUrl") or config.get("url") or config.get("host", "")
 
         if not url:
             return {
@@ -160,6 +161,10 @@ class HTTPExecutor(BaseExecutor):
             )
             for addr_info in addr_infos:
                 ip_str = addr_info[4][0]
+                # Strip IPv6 zone ID (e.g., "fe80::1%25eth0" → "fe80::1")
+                # Zone IDs are local identifiers that could bypass IP-based SSRF checks
+                if '%' in ip_str:
+                    ip_str = ip_str.split('%')[0]
                 ip = ipaddress.ip_address(ip_str)
                 if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                     logger.warning(
@@ -216,18 +221,33 @@ class HTTPExecutor(BaseExecutor):
             params: Request parameters:
                 - url (required): Target URL.
                 - method (optional, default GET): HTTP method.
-                - headers (optional): Request headers dict.
+                - headers (optional): Per-request headers dict.
+                - queryParams (optional): Query parameters dict (appended to URL).
                 - body (optional): Request body (string or dict).
+                - bodyType (optional): Body encoding: json|form|raw|none|auto.
+                - rawContentType (optional): Content-Type for raw body type.
                 - timeout (optional, default 30): Timeout in seconds.
+                - assertions (optional): Response assertions dict.
 
         Returns:
-            Result dict with response status code, headers, and body.
+            Result dict with response status code, headers, body, and bodyParsed.
         """
         url = params.get("url", "")
         method = params.get("method", "GET").upper()
         headers = dict(params.get("headers", {}))
         body = params.get("body")
-        timeout = params.get("timeout", DEFAULT_HTTP_TIMEOUT)
+        body_type = params.get("bodyType", "auto")
+        raw_content_type = params.get("rawContentType", "text/plain")
+        timeout = params.get("timeout") or params.get("timeoutSeconds") or DEFAULT_HTTP_TIMEOUT
+        query_params = params.get("queryParams")
+        assertions = params.get("assertions", {})
+
+        # Merge connection baseUrl with relative URL path
+        base_url = params.get("baseUrl", "")
+        if base_url and url and not url.startswith("http://") and not url.startswith("https://"):
+            url = base_url.rstrip("/") + "/" + url.lstrip("/")
+        elif base_url and not url:
+            url = base_url
 
         if not url:
             return {
@@ -237,6 +257,18 @@ class HTTPExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        # Append query params to URL if provided
+        if query_params and isinstance(query_params, dict):
+            parsed_url = urllib.parse.urlparse(url)
+            existing_qs = urllib.parse.parse_qs(parsed_url.query, keep_blank_values=True)
+            for k, v in query_params.items():
+                existing_qs[k] = [str(v)]
+            new_query = urllib.parse.urlencode(existing_qs, doseq=True)
+            url = urllib.parse.urlunparse((
+                parsed_url.scheme, parsed_url.netloc, parsed_url.path,
+                parsed_url.params, new_query, parsed_url.fragment,
+            ))
 
         # A1: Validate URL scheme — only allow http:// and https://
         parsed_scheme = urllib.parse.urlparse(url)
@@ -292,33 +324,31 @@ class HTTPExecutor(BaseExecutor):
                         "exitCode": -1,
                         "durationMs": 0,
                     }
-            except Exception:
-                pass  # If size check fails, let the request proceed
+            except Exception as exc:
+                logger.warning("Failed to validate request body size: %s", type(exc).__name__)
 
         start = time.monotonic_ns()
         try:
-            # Pin the request to the pre-resolved IP to prevent DNS rebinding.
-            # Rewrite the URL to use the resolved IP and set the Host header
-            # to the original hostname so the server handles it correctly.
+            # DNS rebinding mitigation: rewrite URL to resolved IP for plain HTTP.
+            # For HTTPS, TLS certificate verification binds the connection to the
+            # hostname, so rewriting would break cert validation without adding
+            # security benefit.
             request_url = url
             if resolved_ip and original_hostname:
                 parsed = urllib.parse.urlparse(url)
-                # Wrap IPv6 addresses in brackets for URL netloc
-                ip_for_url = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
-                # Replace hostname with resolved IP in the URL
-                if parsed.port:
-                    netloc = f"{ip_for_url}:{parsed.port}"
-                else:
-                    netloc = ip_for_url
-                request_url = urllib.parse.urlunparse(
-                    (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
-                )
-                # Set Host header to original hostname for correct virtual host routing
-                # Include port in Host header if non-standard
-                if parsed.port and parsed.port not in (80, 443):
-                    headers.setdefault("Host", f"{original_hostname}:{parsed.port}")
-                else:
-                    headers.setdefault("Host", original_hostname)
+                if parsed.scheme == "http":
+                    ip_for_url = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
+                    if parsed.port:
+                        netloc = f"{ip_for_url}:{parsed.port}"
+                    else:
+                        netloc = ip_for_url
+                    request_url = urllib.parse.urlunparse(
+                        (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+                    )
+                    if parsed.port and parsed.port not in (80, 443):
+                        headers.setdefault("Host", f"{original_hostname}:{parsed.port}")
+                    else:
+                        headers.setdefault("Host", original_hostname)
 
             # Build request kwargs
             request_kwargs: dict[str, Any] = {
@@ -328,10 +358,35 @@ class HTTPExecutor(BaseExecutor):
                 "timeout": timeout,
             }
 
-            if body is not None:
-                if isinstance(body, dict):
-                    request_kwargs["json"] = body
+            # Body handling based on bodyType
+            if body_type == "none":
+                pass  # No body
+            elif body is not None:
+                if body_type == "form":
+                    # Form-urlencoded: body can be dict or JSON string
+                    if isinstance(body, str):
+                        try:
+                            body = json.loads(body)
+                        except (ValueError, json.JSONDecodeError):
+                            pass
+                    if isinstance(body, dict):
+                        request_kwargs["data"] = body
+                    else:
+                        request_kwargs["content"] = str(body)
+                elif body_type == "json" or (body_type == "auto" and isinstance(body, dict)):
+                    # JSON body: parse string to dict if needed
+                    if isinstance(body, str):
+                        try:
+                            request_kwargs["json"] = json.loads(body)
+                        except (ValueError, json.JSONDecodeError):
+                            request_kwargs["content"] = body
+                    else:
+                        request_kwargs["json"] = body
+                elif body_type == "raw":
+                    headers.setdefault("Content-Type", raw_content_type)
+                    request_kwargs["content"] = str(body)
                 else:
+                    # auto + string fallback (backward compat)
                     request_kwargs["content"] = str(body)
 
             async with self._client.stream(**request_kwargs) as response:
@@ -360,7 +415,8 @@ class HTTPExecutor(BaseExecutor):
                         addr_info = await loop.run_in_executor(
                             None, socket.getaddrinfo, original_hostname, None
                         )
-                        final_ips = {addr[4][0] for addr in addr_info}
+                        # O4: Strip IPv6 zone IDs for consistent comparison with pre-check
+                        final_ips = {addr[4][0].split('%')[0] for addr in addr_info}
                         if resolved_ip not in final_ips:
                             logger.warning(
                                 "DNS rebinding detected for %s: checked %s, now resolves to %s",
@@ -372,6 +428,15 @@ class HTTPExecutor(BaseExecutor):
                 # Convert headers to dict
                 response_headers = dict(response.headers)
 
+                # Parse JSON response body if content-type indicates JSON
+                body_parsed: dict[str, Any] | list[Any] | None = None
+                content_type = response_headers.get("content-type", "")
+                if "json" in content_type:
+                    try:
+                        body_parsed = json.loads(response_body)
+                    except (ValueError, json.JSONDecodeError):
+                        pass
+
                 # Handle redirect responses (3xx) — we don't follow them to prevent
                 # SSRF bypass via redirects to internal IPs
                 if 300 <= response.status_code < 400:
@@ -382,6 +447,7 @@ class HTTPExecutor(BaseExecutor):
                             "statusCode": response.status_code,
                             "headers": response_headers,
                             "body": response_body,
+                            "bodyParsed": body_parsed,
                             "truncated": truncated,
                             "redirectLocation": redirect_location,
                             "redirectFollowed": False,
@@ -391,16 +457,34 @@ class HTTPExecutor(BaseExecutor):
                         "durationMs": duration_ms,
                     }
 
+                is_success = 200 <= response.status_code < 400
+                output = {
+                    "statusCode": response.status_code,
+                    "headers": response_headers,
+                    "body": response_body,
+                    "bodyParsed": body_parsed,
+                    "truncated": truncated,
+                }
+
+                # Evaluate assertions (may override success to error)
+                if assertions and is_success:
+                    assertion_error = self._evaluate_assertions(
+                        assertions, response.status_code, response_body, body_parsed,
+                    )
+                    if assertion_error:
+                        return {
+                            "status": "error",
+                            "output": output,
+                            "error": f"Assertion failed: {assertion_error}",
+                            "exitCode": 1,
+                            "durationMs": duration_ms,
+                        }
+
                 return {
-                    "status": "success" if 200 <= response.status_code < 400 else "error",
-                    "output": {
-                        "statusCode": response.status_code,
-                        "headers": response_headers,
-                        "body": response_body,
-                        "truncated": truncated,
-                    },
-                    "error": None if 200 <= response.status_code < 400 else f"HTTP {response.status_code}",
-                    "exitCode": 0 if 200 <= response.status_code < 400 else 1,
+                    "status": "success" if is_success else "error",
+                    "output": output,
+                    "error": None if is_success else f"HTTP {response.status_code}",
+                    "exitCode": 0 if is_success else 1,
                     "durationMs": duration_ms,
                 }
 
@@ -434,3 +518,89 @@ class HTTPExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": duration_ms,
             }
+
+    @staticmethod
+    def _evaluate_assertions(
+        assertions: dict[str, Any],
+        status_code: int,
+        body: str,
+        body_parsed: dict[str, Any] | list[Any] | None,
+    ) -> str | None:
+        """Evaluate response assertions and return the first failure message, or None.
+
+        Args:
+            assertions: Dict with optional keys: statusCodes, bodyContains,
+                bodyNotContains, jsonPath, jsonPathValue.
+            status_code: HTTP response status code.
+            body: Response body as string.
+            body_parsed: Parsed JSON body or None.
+
+        Returns:
+            Error message string if an assertion fails, None if all pass.
+        """
+        # Status code assertion
+        status_codes_raw = assertions.get("statusCodes", "")
+        if status_codes_raw:
+            try:
+                if isinstance(status_codes_raw, str):
+                    allowed = [int(c.strip()) for c in status_codes_raw.split(",") if c.strip()]
+                elif isinstance(status_codes_raw, list):
+                    allowed = [int(c) for c in status_codes_raw]
+                else:
+                    allowed = []
+                if allowed and status_code not in allowed:
+                    return f"Status code {status_code} not in expected {allowed}"
+            except (ValueError, TypeError):
+                pass  # Malformed assertion — skip
+
+        # Body contains assertion
+        body_contains = assertions.get("bodyContains", "")
+        if body_contains and body_contains not in body:
+            return f"Body does not contain '{body_contains}'"
+
+        # Body not contains assertion
+        body_not_contains = assertions.get("bodyNotContains", "")
+        if body_not_contains and body_not_contains in body:
+            return f"Body contains forbidden string '{body_not_contains}'"
+
+        # JSON path assertion
+        json_path = assertions.get("jsonPath", "")
+        json_path_value = assertions.get("jsonPathValue", "")
+        if json_path and json_path_value:
+            if body_parsed is None:
+                return f"JSON path '{json_path}' cannot be evaluated: response is not JSON"
+            actual = HTTPExecutor._get_json_path(body_parsed, json_path)
+            if actual is None:
+                return f"JSON path '{json_path}' not found in response"
+            if str(actual) != str(json_path_value):
+                return f"JSON path '{json_path}' is '{actual}', expected '{json_path_value}'"
+
+        return None
+
+    @staticmethod
+    def _get_json_path(data: Any, path: str) -> Any:
+        """Resolve a dot-notation path against a JSON object.
+
+        Supports array index access via numeric segments (e.g. 'data.items.0.id').
+
+        Args:
+            data: Parsed JSON data (dict or list).
+            path: Dot-notation path string.
+
+        Returns:
+            The value at the path, or None if not found.
+        """
+        current = data
+        for segment in path.split("."):
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(segment)
+            elif isinstance(current, list):
+                try:
+                    current = current[int(segment)]
+                except (ValueError, IndexError):
+                    return None
+            else:
+                return None
+        return current

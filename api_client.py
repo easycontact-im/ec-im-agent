@@ -13,6 +13,7 @@ import psutil
 import httpx
 
 from config import settings
+from result_queue import ResultQueue
 
 try:
     AGENT_VERSION = pkg_version("ec-im-agent")
@@ -65,6 +66,8 @@ class CircuitBreaker:
         self._lock = asyncio.Lock()
         # Add jitter: randomize the effective reset timeout by ±25%
         self._jittered_timeout = self._new_jittered_timeout()
+        # Y2: Only allow one probe request in HALF_OPEN state
+        self._half_open_probe_in_flight = False
 
     def _new_jittered_timeout(self) -> float:
         """Generate a new jittered timeout value (±25% of base reset_timeout)."""
@@ -73,13 +76,19 @@ class CircuitBreaker:
         )
 
     async def can_execute(self) -> bool:
-        """Check if a request can be made."""
+        """Check if a request can be made.
+
+        In HALF_OPEN state, only one probe request is allowed through.
+        All other requests are blocked until the probe succeeds or fails.
+        This prevents thundering herd on a recovering API.
+        """
         async with self._lock:
             if self.state == CircuitState.CLOSED:
                 return True
             elif self.state == CircuitState.OPEN:
                 if time.monotonic() - self.last_failure_time >= self._jittered_timeout:
                     self.state = CircuitState.HALF_OPEN
+                    self._half_open_probe_in_flight = True
                     logger.info(
                         "Circuit breaker transitioning to HALF_OPEN after %ds cooldown.",
                         self.reset_timeout,
@@ -87,6 +96,10 @@ class CircuitBreaker:
                     return True
                 return False
             else:  # HALF_OPEN
+                # Only allow one probe request through — block the rest
+                if self._half_open_probe_in_flight:
+                    return False
+                self._half_open_probe_in_flight = True
                 return True
 
     async def record_success(self) -> None:
@@ -96,6 +109,7 @@ class CircuitBreaker:
                 logger.info("Circuit breaker CLOSED — API recovered.")
             self.failure_count = 0
             self.state = CircuitState.CLOSED
+            self._half_open_probe_in_flight = False
 
     async def record_failure(self) -> None:
         """Record a failed API call."""
@@ -109,16 +123,17 @@ class CircuitBreaker:
                     "Circuit breaker OPENED after %d consecutive failures. "
                     "Will retry in %ds.",
                     self.failure_count,
-                    self.reset_timeout,
+                    int(self._jittered_timeout),
                 )
             elif self.state == CircuitState.HALF_OPEN:
                 # Test request failed — go back to OPEN
                 self.state = CircuitState.OPEN
+                self._half_open_probe_in_flight = False
                 self._jittered_timeout = self._new_jittered_timeout()
                 logger.warning(
                     "Circuit breaker test request failed, returning to OPEN state. "
                     "Will retry in %ds.",
-                    self.reset_timeout,
+                    int(self._jittered_timeout),
                 )
 
 
@@ -149,6 +164,11 @@ class APIClient:
         self._jobs_failed: int = 0
         self._start_time: float = time.monotonic()
         self._circuit_breaker = CircuitBreaker()
+        # Persistent queue for results that cannot be submitted when the
+        # circuit breaker is OPEN — lives beside the vault file.
+        from pathlib import Path
+        vault_dir = Path(settings.VAULT_PATH).expanduser().parent
+        self._result_queue = ResultQueue(vault_dir / "result_queue.json")
         psutil.cpu_percent(interval=None)
 
     async def close(self) -> None:
@@ -376,11 +396,11 @@ class APIClient:
             return
 
         if not await self._circuit_breaker.can_execute():
-            self._jobs_failed += len(results)
-            lost_ids = [r.get("jobId", "?") for r in results]
+            queued = self._result_queue.enqueue(results)
+            queued_ids = [r.get("jobId", "?") for r in results[:queued]]
             logger.warning(
-                "Circuit breaker OPEN — cannot submit %d result(s) (lost jobIds: %s)",
-                len(results), lost_ids,
+                "Circuit breaker OPEN — queued %d/%d result(s) to disk (jobIds: %s)",
+                queued, len(results), queued_ids,
             )
             return
 
@@ -393,13 +413,55 @@ class APIClient:
             self._jobs_executed += len(results)
             logger.debug("Results submitted successfully")
             await self._circuit_breaker.record_success()
+            # Piggyback: flush any queued results while the circuit is healthy
+            if self._result_queue.size > 0:
+                await self.retry_queued_results()
         except Exception as exc:
             await self._circuit_breaker.record_failure()
             self._jobs_failed += len(results)
-            lost_ids = [r.get("jobId", "?") for r in results]
+            queued = self._result_queue.enqueue(results)
+            queued_ids = [r.get("jobId", "?") for r in results[:queued]]
             logger.error(
-                "Failed to submit %d results (lost jobIds: %s): %s",
-                len(results), lost_ids, exc,
+                "Failed to submit %d result(s), queued %d to disk (jobIds: %s): %s",
+                len(results), queued, queued_ids, exc,
+            )
+
+    async def retry_queued_results(self) -> None:
+        """Drain the persistent result queue and re-submit to the API.
+
+        Only attempts submission when the circuit breaker allows requests.
+        On failure the results are re-enqueued so nothing is lost.
+        """
+        if self._result_queue.size == 0:
+            return
+
+        if not await self._circuit_breaker.can_execute():
+            logger.debug(
+                "Circuit breaker OPEN — skipping queued result retry (%d pending)",
+                self._result_queue.size,
+            )
+            return
+
+        results = self._result_queue.drain()
+        if not results:
+            return
+
+        logger.info("Retrying %d queued result(s)", len(results))
+        try:
+            response = await self._request_with_retry(
+                "POST", RESULTS_ENDPOINT, json=results,
+            )
+            response.raise_for_status()
+            self._jobs_executed += len(results)
+            await self._circuit_breaker.record_success()
+            logger.info("Successfully submitted %d queued result(s)", len(results))
+        except Exception as exc:
+            await self._circuit_breaker.record_failure()
+            # Re-enqueue so results are not lost
+            requeued = self._result_queue.enqueue(results)
+            logger.error(
+                "Failed to submit queued results, re-enqueued %d/%d: %s",
+                requeued, len(results), exc,
             )
 
     async def heartbeat(

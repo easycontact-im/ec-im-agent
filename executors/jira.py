@@ -122,18 +122,64 @@ class JiraExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-    def _get_credentials(self, connection_id: str | None) -> dict[str, Any] | None:
-        """Get Jira credentials from vault.
+    def _get_credentials(self, connection_id: str | None, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Get Jira credentials from vault, merged with connection config.
+
+        Vault stores apiToken; connection config stores baseUrl and username (email).
+        This method merges both sources so the executor has all required fields.
 
         Args:
             connection_id: Connection ID for vault lookup.
+            params: Job params that may contain connectionConfig.
 
         Returns:
             Credentials dict with baseUrl, email, apiToken, or None if not found.
         """
-        if not connection_id:
+        merged: dict[str, Any] = {}
+
+        # Get connection config from params (baseUrl, username/email)
+        if params:
+            config = params.get("connectionConfig", {})
+            if isinstance(config, dict):
+                merged.update(config)
+            # Also check params directly (workflow jobs merge config into params)
+            for key in ("baseUrl", "username", "email", "apiToken"):
+                if key in (params or {}) and params[key]:
+                    merged[key] = params[key]
+
+        # Get vault credentials (apiToken)
+        if connection_id:
+            cred = self.vault.get_credential(connection_id)
+            if cred:
+                merged.update(cred)
+
+        # Map 'username' to 'email' if needed (config uses 'username', executor uses 'email')
+        if "email" not in merged and "username" in merged:
+            merged["email"] = merged["username"]
+
+        if not merged:
             return None
-        return self.vault.get_credential(connection_id)
+        return merged
+
+    @staticmethod
+    def _validate_base_url(base_url: str) -> dict[str, Any] | None:
+        """Validate that the Jira base URL uses HTTPS.
+
+        Args:
+            base_url: The Jira instance base URL.
+
+        Returns:
+            An error result dict if the URL does not use HTTPS, or None if valid.
+        """
+        if not base_url.startswith("https://"):
+            return {
+                "status": "error",
+                "output": None,
+                "error": "Jira base URL must use HTTPS. Received URL does not start with 'https://'.",
+                "exitCode": -1,
+                "durationMs": 0,
+            }
+        return None
 
     def _auth_header(self, email: str, api_token: str) -> str:
         """Build Basic Auth header value for Jira API.
@@ -178,7 +224,7 @@ class JiraExecutor(BaseExecutor):
         Returns:
             Result dict with issueId, issueKey, and URL on success.
         """
-        cred = self._get_credentials(connection_id)
+        cred = self._get_credentials(connection_id, params)
         if not cred:
             return {
                 "status": "error",
@@ -191,6 +237,10 @@ class JiraExecutor(BaseExecutor):
         base_url = cred.get("baseUrl", "").rstrip("/")
         email = cred.get("email", "")
         api_token = cred.get("apiToken", "")
+
+        url_error = self._validate_base_url(base_url)
+        if url_error:
+            return url_error
 
         project_key = params.get("projectKey", "")
         summary = params.get("summary", "")
@@ -286,7 +336,7 @@ class JiraExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Jira createIssue failed for connection %s: %s", connection_id, exc)
+            logger.error("Jira createIssue failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -308,7 +358,7 @@ class JiraExecutor(BaseExecutor):
         Returns:
             Result dict confirming the update on success.
         """
-        cred = self._get_credentials(connection_id)
+        cred = self._get_credentials(connection_id, params)
         if not cred:
             return {
                 "status": "error",
@@ -321,6 +371,10 @@ class JiraExecutor(BaseExecutor):
         base_url = cred.get("baseUrl", "").rstrip("/")
         email = cred.get("email", "")
         api_token = cred.get("apiToken", "")
+
+        url_error = self._validate_base_url(base_url)
+        if url_error:
+            return url_error
 
         issue_key = params.get("issueKey", "")
         if not issue_key:
@@ -414,7 +468,7 @@ class JiraExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Jira updateIssue failed for connection %s: %s", connection_id, exc)
+            logger.error("Jira updateIssue failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -435,7 +489,7 @@ class JiraExecutor(BaseExecutor):
         Returns:
             Result dict with commentId on success.
         """
-        cred = self._get_credentials(connection_id)
+        cred = self._get_credentials(connection_id, params)
         if not cred:
             return {
                 "status": "error",
@@ -448,6 +502,10 @@ class JiraExecutor(BaseExecutor):
         base_url = cred.get("baseUrl", "").rstrip("/")
         email = cred.get("email", "")
         api_token = cred.get("apiToken", "")
+
+        url_error = self._validate_base_url(base_url)
+        if url_error:
+            return url_error
 
         issue_key = params.get("issueKey", "")
         comment = params.get("comment", "")
@@ -522,7 +580,7 @@ class JiraExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Jira addComment failed for connection %s: %s", connection_id, exc)
+            logger.error("Jira addComment failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -543,7 +601,7 @@ class JiraExecutor(BaseExecutor):
         Returns:
             Result dict confirming the transition on success.
         """
-        cred = self._get_credentials(connection_id)
+        cred = self._get_credentials(connection_id, params)
         if not cred:
             return {
                 "status": "error",
@@ -556,6 +614,10 @@ class JiraExecutor(BaseExecutor):
         base_url = cred.get("baseUrl", "").rstrip("/")
         email = cred.get("email", "")
         api_token = cred.get("apiToken", "")
+
+        url_error = self._validate_base_url(base_url)
+        if url_error:
+            return url_error
 
         issue_key = params.get("issueKey", "")
         transition_id = params.get("transitionId", "")
@@ -615,7 +677,7 @@ class JiraExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Jira transitionIssue failed for connection %s: %s", connection_id, exc)
+            logger.error("Jira transitionIssue failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -636,7 +698,7 @@ class JiraExecutor(BaseExecutor):
         Returns:
             Result dict with user info on success.
         """
-        cred = self._get_credentials(connection_id)
+        cred = self._get_credentials(connection_id, params)
         if not cred:
             return {
                 "status": "error",
@@ -649,6 +711,10 @@ class JiraExecutor(BaseExecutor):
         base_url = cred.get("baseUrl", "").rstrip("/")
         email = cred.get("email", "")
         api_token = cred.get("apiToken", "")
+
+        url_error = self._validate_base_url(base_url)
+        if url_error:
+            return url_error
 
         start = time.monotonic_ns()
         try:
@@ -674,10 +740,16 @@ class JiraExecutor(BaseExecutor):
                     "durationMs": duration_ms,
                 }
             else:
+                error_body = response.text[:500]
+                detail = f"Jira auth failed ({response.status_code})"
+                if error_body:
+                    detail += f": {error_body}"
+                if response.status_code == 401:
+                    detail += ". Verify: (1) email matches your Atlassian account, (2) API token is valid (not OAuth), (3) baseUrl is correct"
                 return {
                     "status": "error",
-                    "output": {"statusCode": response.status_code},
-                    "error": f"Jira auth failed ({response.status_code})",
+                    "output": {"statusCode": response.status_code, "body": error_body},
+                    "error": detail,
                     "exitCode": 1,
                     "durationMs": duration_ms,
                 }
@@ -694,7 +766,7 @@ class JiraExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Jira testConnection failed for connection %s: %s", connection_id, exc)
+            logger.error("Jira testConnection failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,

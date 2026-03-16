@@ -155,6 +155,7 @@ class AdminServer:
         self._app.router.add_get("/connections", self._list_connections)
         self._app.router.add_delete("/connections/{id}", self._delete_connection)
         self._app.router.add_post("/connections/{id}/test", self._test_connection)
+        self._app.router.add_post("/vault/rekey", self._rekey_vault)
 
     async def start(self) -> None:
         """Start the admin HTTP server on localhost.
@@ -200,7 +201,10 @@ class AdminServer:
                 status=400,
             )
 
-        self._vault.store_credential(connection_id, credential_data)
+        try:
+            self._vault.store_credential(connection_id, credential_data)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         logger.info("Stored credential via admin API: %s", connection_id)
         return web.json_response({
@@ -235,7 +239,10 @@ class AdminServer:
         """
         connection_id = request.match_info["id"]
 
-        deleted = self._vault.delete_credential(connection_id)
+        try:
+            deleted = self._vault.delete_credential(connection_id)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         if deleted:
             logger.info("Deleted credential via admin API: %s", connection_id)
@@ -263,7 +270,10 @@ class AdminServer:
         """
         connection_id = request.match_info["id"]
 
-        credential = self._vault.get_credential(connection_id)
+        try:
+            credential = self._vault.get_credential(connection_id)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
         if credential is None:
             return web.json_response(
@@ -284,4 +294,53 @@ class AdminServer:
                 "connectionId": connection_id,
                 "fields": credential_keys,
             },
+        })
+
+    async def _rekey_vault(self, request: web.Request) -> web.Response:
+        """Re-key the vault with a new API key.
+
+        POST /vault/rekey
+        Body: { "newApiKey": "ea_agent_xxxxx" }
+
+        Decrypts all credentials with the current key and re-encrypts them
+        with a key derived from the new API key. Must be called BEFORE rotating
+        the AGENT_API_KEY environment variable.
+
+        Returns:
+            200 with count of re-keyed credentials, 400 on invalid input, 500 on failure.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"success": False, "error": "Invalid JSON body"},
+                status=400,
+            )
+
+        new_api_key = body.get("newApiKey", "")
+        if not new_api_key or not isinstance(new_api_key, str):
+            return web.json_response(
+                {"success": False, "error": "newApiKey is required and must be a non-empty string"},
+                status=400,
+            )
+
+        try:
+            count = self._vault.rekey(new_api_key)
+        except ValueError as exc:
+            return web.json_response(
+                {"success": False, "error": str(exc)},
+                status=400,
+            )
+        except Exception as exc:
+            logger.error("Vault rekey failed: %s", exc)
+            return web.json_response(
+                {"success": False, "error": "Vault rekey failed unexpectedly"},
+                status=500,
+            )
+
+        logger.info("Vault re-keyed via admin API: %d credential(s)", count)
+        return web.json_response({
+            "success": True,
+            "data": {"rekeyedCount": count},
+            "message": f"Vault re-keyed successfully: {count} credential(s)",
         })

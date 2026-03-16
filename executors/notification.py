@@ -68,6 +68,8 @@ class NotificationExecutor(BaseExecutor):
         """
         if action == "sendNotification":
             return await self._send_notification(params)
+        elif action == "testConnection":
+            return await self._test_connection(params)
         else:
             return {
                 "status": "error",
@@ -94,7 +96,8 @@ class NotificationExecutor(BaseExecutor):
         channel = params.get("channel")
 
         # M8: Truncate oversized messages to prevent excessive payload sizes
-        if len(message) > MAX_MESSAGE_SIZE:
+        was_truncated = len(message) > MAX_MESSAGE_SIZE
+        if was_truncated:
             message = message[:MAX_MESSAGE_SIZE]
             logger.warning("Notification message truncated to %d characters", MAX_MESSAGE_SIZE)
 
@@ -143,6 +146,7 @@ class NotificationExecutor(BaseExecutor):
                         "type": notification_type,
                         "channel": channel,
                         "attempts": attempt,
+                        "truncated": was_truncated,
                     },
                     "error": None,
                     "exitCode": 0,
@@ -179,7 +183,7 @@ class NotificationExecutor(BaseExecutor):
             except Exception as exc:
                 last_error = str(exc)
                 logger.warning(
-                    "Notification attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc,
+                    "Notification attempt %d/%d failed: %s", attempt, MAX_RETRIES, type(exc).__name__,
                 )
 
             # Exponential backoff before retry (skip on last attempt)
@@ -198,3 +202,50 @@ class NotificationExecutor(BaseExecutor):
             "exitCode": -1,
             "durationMs": duration_ms,
         }
+
+    async def _test_connection(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Test notification connectivity by verifying the SaaS API is reachable.
+
+        Since the notification executor relays through the SaaS API, connectivity
+        is confirmed if the agent is running and the API client is functional.
+
+        Args:
+            params: Unused, present for interface consistency.
+
+        Returns:
+            Result dict indicating whether the notification channel is operational.
+        """
+        start = time.monotonic_ns()
+        try:
+            response = await self._client.get("/api/v1/health/healthz")
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+
+            if response.status_code == 200:
+                return {
+                    "status": "success",
+                    "output": {
+                        "message": "Notification channel is operational (SaaS API reachable)",
+                    },
+                    "error": None,
+                    "exitCode": 0,
+                    "durationMs": duration_ms,
+                }
+            else:
+                return {
+                    "status": "error",
+                    "output": {"statusCode": response.status_code},
+                    "error": f"SaaS API health check returned status {response.status_code}",
+                    "exitCode": 1,
+                    "durationMs": duration_ms,
+                }
+
+        except Exception as exc:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error("Notification testConnection failed: %s", type(exc).__name__)
+            return {
+                "status": "error",
+                "output": None,
+                "error": f"SaaS API is not reachable: {type(exc).__name__}",
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }

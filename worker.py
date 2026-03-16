@@ -1,8 +1,10 @@
 import asyncio
 import json as _json
 import logging
+import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from executors import EXECUTOR_REGISTRY
@@ -16,6 +18,11 @@ MAX_PARAMS_SIZE_BYTES = 10_485_760  # 10MB max params size
 MAX_SEMAPHORE_WAIT = 60  # seconds — max time to wait for an execution slot
 JOB_DEDUP_TTL_SECONDS = MAX_JOB_TIMEOUT + 60  # Job timeout + 1min buffer — must exceed max job duration
 JOB_DEDUP_MAX_SIZE = 10_000  # Maximum entries in the dedup set
+DEDUP_SAVE_INTERVAL_SECONDS = 60  # How often to persist dedup state to disk
+_DEDUP_FILE_PATH = Path(os.path.expanduser("~")) / ".easyalert" / "processed_jobs.json"
+
+
+MAX_ERROR_MESSAGE_LENGTH = 500
 
 
 class Worker:
@@ -25,23 +32,29 @@ class Worker:
     enforcing a maximum concurrency limit via asyncio.Semaphore.
     """
 
-    def __init__(self, vault: Vault, max_concurrent_jobs: int) -> None:
+    def __init__(self, vault: Vault, max_concurrent_jobs: int, *, is_tls: bool = True) -> None:
         """Initialize the worker.
 
         Args:
             vault: Vault instance for credential access.
             max_concurrent_jobs: Maximum number of jobs that can run concurrently.
+            is_tls: Whether the SaaS API connection uses TLS (HTTPS).
         """
         self._vault = vault
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._is_tls = is_tls
         self._executor_cache: dict[str, Any] = {}
         self._executor_cache_lock = asyncio.Lock()
         # Job deduplication: {jobId: monotonic_timestamp}
         self._processed_jobs: dict[str, float] = {}
         self._dedup_lock = asyncio.Lock()
+        self._last_dedup_save: float = time.monotonic()
+        self._load_dedup_state()
 
     async def close(self) -> None:
         """Close all cached executors that have a close method."""
+        # Persist dedup state before shutting down
+        self._save_dedup_state()
         for key, executor in self._executor_cache.items():
             if hasattr(executor, "close"):
                 try:
@@ -49,6 +62,67 @@ class Worker:
                 except Exception as exc:
                     logger.warning("Failed to close executor %s: %s", key, exc)
         self._executor_cache.clear()
+
+    def _load_dedup_state(self) -> None:
+        """Load previously processed jobs from disk for restart resilience.
+
+        Reads the dedup file and restores entries that are still within the
+        TTL window. Uses wall-clock time (stored as epoch seconds) since
+        monotonic timestamps do not survive restarts.
+        """
+        if not _DEDUP_FILE_PATH.exists():
+            return
+        try:
+            with open(_DEDUP_FILE_PATH, "r") as f:
+                data = _json.load(f)
+            if not isinstance(data, dict):
+                logger.warning("Invalid dedup file format, ignoring")
+                return
+            now_epoch = time.time()
+            now_mono = time.monotonic()
+            loaded = 0
+            for job_id, epoch_ts in data.items():
+                if not isinstance(epoch_ts, (int, float)):
+                    continue
+                age_seconds = now_epoch - epoch_ts
+                if age_seconds < JOB_DEDUP_TTL_SECONDS:
+                    # Map the wall-clock age back to a monotonic timestamp
+                    self._processed_jobs[job_id] = now_mono - age_seconds
+                    loaded += 1
+            if loaded:
+                logger.info(
+                    "Loaded %d processed job(s) from dedup state file", loaded,
+                )
+        except (_json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to load dedup state from %s: %s", _DEDUP_FILE_PATH, exc)
+
+    def _save_dedup_state(self) -> None:
+        """Persist processed jobs to disk for restart resilience.
+
+        Converts monotonic timestamps to wall-clock epoch seconds for
+        portability across restarts. Only saves entries within the TTL window.
+        """
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        cutoff = now_mono - JOB_DEDUP_TTL_SECONDS
+
+        # Build dict with epoch timestamps, trimming expired entries
+        state: dict[str, float] = {}
+        for job_id, mono_ts in self._processed_jobs.items():
+            if mono_ts >= cutoff:
+                # Convert monotonic to epoch: epoch = now_epoch - (now_mono - mono_ts)
+                state[job_id] = now_epoch - (now_mono - mono_ts)
+
+        try:
+            _DEDUP_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = _DEDUP_FILE_PATH.with_suffix(".tmp")
+            with open(temp_path, "w") as f:
+                _json.dump(state, f)
+            os.replace(temp_path, _DEDUP_FILE_PATH)
+            logger.debug("Saved dedup state: %d job(s)", len(state))
+        except OSError as exc:
+            logger.warning("Failed to save dedup state to %s: %s", _DEDUP_FILE_PATH, exc)
+        self._last_dedup_save = now_mono
 
     async def _get_executor(self, executor_key: str) -> Any:
         """Get or create an executor instance by key.
@@ -101,7 +175,10 @@ class Worker:
     async def _is_duplicate_job(self, job_id: str) -> bool:
         """Check if a job has already been processed recently.
 
-        Also evicts expired entries when the set exceeds MAX size.
+        O1: Only checks the dedup set — does NOT register the job here.
+        Registration happens after execution via _mark_job_completed().
+        This prevents crash/shutdown from permanently marking unfinished
+        jobs as done in the persisted dedup state.
 
         Args:
             job_id: The job identifier to check.
@@ -109,20 +186,33 @@ class Worker:
         Returns:
             True if the job was already processed (duplicate), False otherwise.
         """
-        now = time.monotonic()
         async with self._dedup_lock:
             if job_id in self._processed_jobs:
                 logger.warning("Duplicate job detected, skipping: jobId=%s", job_id)
                 return True
-            # Register this job as in-progress
+        return False
+
+    async def _mark_job_completed(self, job_id: str) -> None:
+        """Register a job as completed in the dedup set.
+
+        Called after execution finishes (success or failure) so that
+        incomplete jobs are not permanently marked as processed.
+        """
+        now = time.monotonic()
+        async with self._dedup_lock:
             self._processed_jobs[job_id] = now
-            # Evict expired entries if set is too large
+            # Evict expired entries; if still over max, evict oldest
             if len(self._processed_jobs) > JOB_DEDUP_MAX_SIZE:
                 cutoff = now - JOB_DEDUP_TTL_SECONDS
                 expired = [k for k, t in self._processed_jobs.items() if t < cutoff]
                 for k in expired:
                     del self._processed_jobs[k]
-        return False
+                # D2: If still over max after TTL eviction, remove oldest entries
+                if len(self._processed_jobs) > JOB_DEDUP_MAX_SIZE:
+                    sorted_entries = sorted(self._processed_jobs.items(), key=lambda x: x[1])
+                    to_remove = len(self._processed_jobs) - JOB_DEDUP_MAX_SIZE + 100
+                    for k, _ in sorted_entries[:to_remove]:
+                        del self._processed_jobs[k]
 
     async def execute_job(self, job: dict[str, Any]) -> dict[str, Any]:
         """Execute a single workflow job with semaphore throttling.
@@ -205,6 +295,10 @@ class Worker:
             if action_type == "connection.test":
                 return await self._test_connection(job_id, connection_id, start)
 
+            # Handle credential storage jobs
+            if action_type == "system.storeCredential":
+                return await self._store_credential(job_id, params, start)
+
             executor_key = self._resolve_executor_key(action_type)
             action = self._resolve_action(action_type)
 
@@ -270,16 +364,21 @@ class Worker:
                     "Job failed: jobId=%s error=%s durationMs=%d",
                     job_id, exc, duration_ms,
                 )
+                error_msg = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
                 return {
                     "jobId": job_id,
                     "status": "error",
                     "output": None,
-                    "error": str(exc),
+                    "error": error_msg,
                     "exitCode": -1,
                     "durationMs": duration_ms,
                 }
         finally:
             self._semaphore.release()
+            # O1: Mark job as completed AFTER execution finishes, not before.
+            # This ensures crash/shutdown won't leave unfinished jobs in the
+            # persisted dedup set, which would block them for the TTL period.
+            await self._mark_job_completed(job_id)
 
     async def _test_connection(
         self, job_id: str, connection_id: str | None, start: int
@@ -326,6 +425,88 @@ class Worker:
             "durationMs": duration_ms,
         }
 
+    async def _store_credential(
+        self, job_id: str, params: dict[str, Any], start: int
+    ) -> dict[str, Any]:
+        """Store credentials in the encrypted vault.
+
+        Called when the SaaS API proxies a credential delivery request.
+
+        Args:
+            job_id: The job identifier.
+            params: Job params containing connectionId and credentials.
+            start: Monotonic start time in nanoseconds.
+
+        Returns:
+            Result dict indicating success or failure.
+        """
+        # H8: Block credential storage over non-TLS connections
+        if not self._is_tls:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            return {
+                "jobId": job_id,
+                "status": "error",
+                "output": None,
+                "error": "Credential storage requires HTTPS connection to SaaS API",
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }
+
+        connection_id = params.get("connectionId")
+        credentials = params.get("credentials")
+
+        if not connection_id:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            return {
+                "jobId": job_id,
+                "status": "error",
+                "output": None,
+                "error": "No connectionId provided for credential storage",
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }
+
+        if not credentials or not isinstance(credentials, dict):
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            return {
+                "jobId": job_id,
+                "status": "error",
+                "output": None,
+                "error": "No credentials provided or invalid format",
+                "exitCode": -1,
+                "durationMs": duration_ms,
+            }
+
+        try:
+            self._vault.store_credential(connection_id, credentials)
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.info(
+                "Credentials stored for connection %s (jobId=%s)",
+                connection_id, job_id,
+            )
+            return {
+                "jobId": job_id,
+                "status": "success",
+                "output": {"message": "Credentials stored in vault"},
+                "error": None,
+                "exitCode": 0,
+                "durationMs": duration_ms,
+            }
+        except Exception as exc:
+            duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+            logger.error(
+                "Failed to store credentials for connection %s: %s",
+                connection_id, exc,
+            )
+            return {
+                "jobId": job_id,
+                "status": "error",
+                "output": None,
+                "error": "Failed to store credentials in vault",
+                "exitCode": 1,
+                "durationMs": duration_ms,
+            }
+
     async def run_jobs(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Execute multiple jobs concurrently and return all results.
 
@@ -362,5 +543,9 @@ class Worker:
                 })
             else:
                 results.append(raw)
+
+        # Periodically persist dedup state to disk
+        if time.monotonic() - self._last_dedup_save >= DEDUP_SAVE_INTERVAL_SECONDS:
+            self._save_dedup_state()
 
         return results

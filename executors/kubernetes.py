@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any
 
@@ -14,9 +15,17 @@ logger = logging.getLogger("ec-im-agent.executors.kubernetes")
 DEFAULT_K8S_TIMEOUT = 60
 MAX_OUTPUT_SIZE = 1_048_576  # 1 MB
 MAX_KUBECONFIG_SIZE = 1_048_576  # 1 MB
+MAX_MULTI_POD_LOGS = 10          # Max pods for regex/selector mode
+MAX_PARALLEL_LOG_FETCHES = 5     # Concurrent kubectl logs calls
+MAX_REGEX_PATTERN_LENGTH = 200   # ReDoS protection
+MAX_LABEL_SELECTOR_LENGTH = 500
+MAX_REPLICAS = 10000
 
 # RFC 1123 DNS label: lowercase alphanumeric, hyphens allowed in the middle, max 253 chars
 _RESOURCE_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$")
+
+# Whitelist for label selector characters (prevents injection)
+_LABEL_SELECTOR_RE = re.compile(r"^[a-zA-Z0-9_./ \-=!,()]+$")
 
 
 def _validate_positive_int(value: Any, param_name: str) -> tuple[int | None, dict[str, Any] | None]:
@@ -50,6 +59,83 @@ def _validate_positive_int(value: Any, param_name: str) -> tuple[int | None, dic
             "durationMs": 0,
         }
     return int_val, None
+
+
+def _validate_regex_pattern(pattern: str) -> tuple[re.Pattern[str] | None, dict[str, Any] | None]:
+    """Validate and compile a pod name regex pattern.
+
+    Args:
+        pattern: The regex pattern to validate.
+
+    Returns:
+        Tuple of (compiled_pattern, None) on success, or (None, error_dict) on failure.
+    """
+    if not pattern:
+        return None, {
+            "status": "error",
+            "output": None,
+            "error": "Pod pattern cannot be empty",
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+    if len(pattern) > MAX_REGEX_PATTERN_LENGTH:
+        return None, {
+            "status": "error",
+            "output": None,
+            "error": f"Pod pattern too long: {len(pattern)} chars (max {MAX_REGEX_PATTERN_LENGTH})",
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+    try:
+        compiled = re.compile(pattern)
+        return compiled, None
+    except re.error as exc:
+        return None, {
+            "status": "error",
+            "output": None,
+            "error": f"Invalid regex pattern '{pattern}': {exc}",
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+
+
+def _validate_label_selector(selector: str) -> dict[str, Any] | None:
+    """Validate a Kubernetes label selector string.
+
+    Args:
+        selector: The label selector to validate (e.g. 'app=ec-ui,tier=frontend').
+
+    Returns:
+        An error result dict if invalid, or None if valid.
+    """
+    if not selector:
+        return {
+            "status": "error",
+            "output": None,
+            "error": "Label selector cannot be empty",
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+    if len(selector) > MAX_LABEL_SELECTOR_LENGTH:
+        return {
+            "status": "error",
+            "output": None,
+            "error": f"Label selector too long: {len(selector)} chars (max {MAX_LABEL_SELECTOR_LENGTH})",
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+    if not _LABEL_SELECTOR_RE.match(selector):
+        return {
+            "status": "error",
+            "output": None,
+            "error": (
+                f"Invalid label selector: '{selector}'. "
+                f"Only alphanumeric, '.', '_', '/', '-', '=', '!', ',', '(', ')', and spaces are allowed."
+            ),
+            "exitCode": -1,
+            "durationMs": 0,
+        }
+    return None
 
 
 def _validate_resource_name(name: str, resource_type: str) -> dict[str, Any] | None:
@@ -135,33 +221,49 @@ class KubernetesExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-    def _get_kubeconfig_path(self, connection_id: str | None) -> str | None:
-        """Get the kubeconfig path from vault credentials.
-
-        Args:
-            connection_id: Connection ID for credential lookup.
+    def _resolve_kubeconfig(self, connection_id: str | None) -> tuple[str | None, bool]:
+        """Resolve kubeconfig — write vault content to secure temp file, or use legacy path.
 
         Returns:
-            Path to kubeconfig file, or None if not found.
+            Tuple of (kubeconfig_path, is_temp).
+            is_temp=True means the caller MUST clean up the file after use.
 
         Raises:
-            ValueError: If the kubeconfig path contains path traversal or is not absolute.
+            ValueError: If credential content is too large or legacy path is invalid.
         """
         if not connection_id:
-            return None
+            return None, False
 
         credentials = self.vault.get_credential(connection_id)
         if credentials is None:
-            return None
+            return None, False
 
+        # Primary: kubeconfig YAML content from vault → secure temp file
+        kubeconfig_content = credentials.get("kubeconfig")
+        if kubeconfig_content:
+            content_size = len(kubeconfig_content.encode("utf-8"))
+            if content_size > MAX_KUBECONFIG_SIZE:
+                raise ValueError(
+                    f"kubeconfig content too large: {content_size} bytes (max {MAX_KUBECONFIG_SIZE})"
+                )
+            fd, path = tempfile.mkstemp(suffix=".yaml", prefix="kubeconfig_")
+            try:
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError):
+                # fchmod not available on Windows; best-effort
+                pass
+            with os.fdopen(fd, "w") as f:
+                f.write(kubeconfig_content)
+            logger.debug("Wrote kubeconfig content to temp file: %s", path)
+            return path, True
+
+        # Legacy fallback: kubeconfigPath (for existing connections that stored a file path)
         kubeconfig_path = credentials.get("kubeconfigPath")
-        # Validate kubeconfig path to prevent path traversal and symlink attacks
         if kubeconfig_path:
-            if '..' in kubeconfig_path or not os.path.isabs(kubeconfig_path):
+            if ".." in kubeconfig_path or not os.path.isabs(kubeconfig_path):
                 raise ValueError(
                     "Invalid kubeconfig path: must be absolute with no '..' components"
                 )
-            # Resolve symlinks and verify the real path matches expected location
             try:
                 real_path = os.path.realpath(kubeconfig_path)
                 if real_path != os.path.normpath(kubeconfig_path):
@@ -176,7 +278,6 @@ class KubernetesExecutor(BaseExecutor):
             except OSError as exc:
                 raise ValueError(f"Cannot resolve kubeconfig path: {exc}")
 
-            # H7: Validate file size to prevent loading excessively large files
             try:
                 file_size = os.path.getsize(kubeconfig_path)
                 if file_size > MAX_KUBECONFIG_SIZE:
@@ -186,16 +287,50 @@ class KubernetesExecutor(BaseExecutor):
             except OSError as exc:
                 raise ValueError(f"Cannot read kubeconfig file: {exc}")
 
-        return kubeconfig_path
+            return kubeconfig_path, False
 
-    def _build_base_cmd(self, kubeconfig_path: str | None) -> list[str]:
-        """Build the base kubectl command with optional kubeconfig.
+        return None, False
 
-        Re-verifies the kubeconfig path hasn't been replaced by a symlink
-        since the initial validation (TOCTOU mitigation).
+    @staticmethod
+    def _cleanup_temp_kubeconfig(path: str | None, is_temp: bool) -> None:
+        """Remove a temporary kubeconfig file if applicable."""
+        if is_temp and path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _resolve_connection_params(params: dict[str, Any]) -> tuple[str | None, str]:
+        """Extract context and namespace from params or nested connectionConfig.
+
+        The backend passes connection config as ``connectionConfig`` in test jobs,
+        and as top-level keys for regular jobs (merged by job_dispatcher).
+
+        Returns:
+            Tuple of (context, namespace).
+        """
+        conn_cfg = params.get("connectionConfig") or {}
+        context = params.get("context") or conn_cfg.get("context") or None
+        namespace = params.get("namespace") or conn_cfg.get("namespace") or "default"
+        return context, namespace
+
+    def _build_base_cmd(
+        self,
+        kubeconfig_path: str | None,
+        context: str | None = None,
+        is_temp: bool = False,
+    ) -> list[str]:
+        """Build the base kubectl command with optional kubeconfig and context.
+
+        For non-temp (legacy path) files, re-verifies the kubeconfig path hasn't
+        been replaced by a symlink since the initial validation (TOCTOU mitigation).
+        Temp files are created by us and don't need symlink checks.
 
         Args:
             kubeconfig_path: Optional path to kubeconfig file.
+            context: Optional Kubernetes context to use.
+            is_temp: Whether the kubeconfig is a temp file we created.
 
         Returns:
             Base command list starting with 'kubectl'.
@@ -205,17 +340,20 @@ class KubernetesExecutor(BaseExecutor):
         """
         cmd = ["kubectl"]
         if kubeconfig_path:
-            # Re-verify path right before execution (TOCTOU mitigation)
-            try:
-                final_path = os.path.realpath(kubeconfig_path)
-            except OSError as exc:
-                raise ValueError(f"Cannot resolve kubeconfig path at execution time: {exc}")
-            if final_path != os.path.normpath(kubeconfig_path):
-                raise ValueError(
-                    f"Kubeconfig path changed during execution (possible symlink attack): "
-                    f"{kubeconfig_path} -> {final_path}"
-                )
+            if not is_temp:
+                # Re-verify path right before execution (TOCTOU mitigation)
+                try:
+                    final_path = os.path.realpath(kubeconfig_path)
+                except OSError as exc:
+                    raise ValueError(f"Cannot resolve kubeconfig path at execution time: {exc}")
+                if final_path != os.path.normpath(kubeconfig_path):
+                    raise ValueError(
+                        f"Kubeconfig path changed during execution (possible symlink attack): "
+                        f"{kubeconfig_path} -> {final_path}"
+                    )
             cmd.extend(["--kubeconfig", kubeconfig_path])
+        if context:
+            cmd.extend(["--context", context])
         return cmd
 
     async def _run_kubectl(
@@ -301,40 +439,43 @@ class KubernetesExecutor(BaseExecutor):
 
         Args:
             connection_id: Connection ID for kubeconfig lookup.
-            params: Must contain 'deployment'. Optional: 'namespace', 'timeout'.
+            params: Must contain 'deployment'. Optional: 'namespace', 'context', 'timeout'.
 
         Returns:
             Result dict.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        deployment = params.get("deployment", "")
-        namespace = params.get("namespace", "default")
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, namespace = self._resolve_connection_params(params)
+            deployment = params.get("deployment", "")
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
 
-        if not deployment:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Deployment name is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
+            if not deployment:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Deployment name is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        validation_error = _validate_resource_name(deployment, "deployment")
-        if validation_error:
-            return validation_error
-        validation_error = _validate_resource_name(namespace, "namespace")
-        if validation_error:
-            return validation_error
+            validation_error = _validate_resource_name(deployment, "deployment")
+            if validation_error:
+                return validation_error
+            validation_error = _validate_resource_name(namespace, "namespace")
+            if validation_error:
+                return validation_error
 
-        cmd = self._build_base_cmd(kubeconfig)
-        cmd.extend([
-            "rollout", "restart", f"deployment/{deployment}",
-            "-n", namespace,
-        ])
+            cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+            cmd.extend([
+                "rollout", "restart", f"deployment/{deployment}",
+                "-n", namespace,
+            ])
 
-        logger.info("Restarting deployment: %s in namespace: %s", deployment, namespace)
-        return await self._run_kubectl(cmd, timeout=timeout)
+            logger.info("Restarting deployment: %s in namespace: %s", deployment, namespace)
+            return await self._run_kubectl(cmd, timeout=timeout)
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)
 
     async def _scale_deployment(
         self, connection_id: str | None, params: dict[str, Any]
@@ -343,59 +484,71 @@ class KubernetesExecutor(BaseExecutor):
 
         Args:
             connection_id: Connection ID for kubeconfig lookup.
-            params: Must contain 'deployment', 'replicas'. Optional: 'namespace', 'timeout'.
+            params: Must contain 'deployment', 'replicas'. Optional: 'namespace', 'context', 'timeout'.
 
         Returns:
             Result dict.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        deployment = params.get("deployment", "")
-        replicas = params.get("replicas")
-        namespace = params.get("namespace", "default")
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, namespace = self._resolve_connection_params(params)
+            deployment = params.get("deployment", "")
+            replicas = params.get("replicas")
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
 
-        if not deployment:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Deployment name is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
+            if not deployment:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Deployment name is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        validation_error = _validate_resource_name(deployment, "deployment")
-        if validation_error:
-            return validation_error
-        validation_error = _validate_resource_name(namespace, "namespace")
-        if validation_error:
-            return validation_error
+            validation_error = _validate_resource_name(deployment, "deployment")
+            if validation_error:
+                return validation_error
+            validation_error = _validate_resource_name(namespace, "namespace")
+            if validation_error:
+                return validation_error
 
-        if replicas is None:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Replica count is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
+            if replicas is None:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Replica count is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        # H1: Validate replicas is a valid non-negative integer
-        replicas, validation_error = _validate_positive_int(replicas, "replicas")
-        if validation_error:
-            return validation_error
+            # H1: Validate replicas is a valid non-negative integer
+            replicas, validation_error = _validate_positive_int(replicas, "replicas")
+            if validation_error:
+                return validation_error
 
-        cmd = self._build_base_cmd(kubeconfig)
-        cmd.extend([
-            "scale", f"deployment/{deployment}",
-            f"--replicas={replicas}",
-            "-n", namespace,
-        ])
+            if replicas > MAX_REPLICAS:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": f"Replica count {replicas} exceeds maximum allowed ({MAX_REPLICAS})",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        logger.info(
-            "Scaling deployment %s to %d replicas in namespace %s",
-            deployment, replicas, namespace,
-        )
-        return await self._run_kubectl(cmd, timeout=timeout)
+            cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+            cmd.extend([
+                "scale", f"deployment/{deployment}",
+                f"--replicas={replicas}",
+                "-n", namespace,
+            ])
+
+            logger.info(
+                "Scaling deployment %s to %d replicas in namespace %s",
+                deployment, replicas, namespace,
+            )
+            return await self._run_kubectl(cmd, timeout=timeout)
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)
 
     async def _delete_pod(
         self, connection_id: str | None, params: dict[str, Any]
@@ -404,44 +557,47 @@ class KubernetesExecutor(BaseExecutor):
 
         Args:
             connection_id: Connection ID for kubeconfig lookup.
-            params: Must contain 'pod'. Optional: 'namespace', 'timeout', 'gracePeriod'.
+            params: Must contain 'pod'. Optional: 'namespace', 'context', 'timeout', 'gracePeriod'.
 
         Returns:
             Result dict.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        pod = params.get("pod", "")
-        namespace = params.get("namespace", "default")
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
-        grace_period = params.get("gracePeriod")
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, namespace = self._resolve_connection_params(params)
+            pod = params.get("pod", "")
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+            grace_period = params.get("gracePeriod")
 
-        if not pod:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Pod name is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
+            if not pod:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Pod name is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        validation_error = _validate_resource_name(pod, "pod")
-        if validation_error:
-            return validation_error
-        validation_error = _validate_resource_name(namespace, "namespace")
-        if validation_error:
-            return validation_error
-
-        cmd = self._build_base_cmd(kubeconfig)
-        cmd.extend(["delete", "pod", pod, "-n", namespace])
-
-        if grace_period is not None:
-            grace_period, validation_error = _validate_positive_int(grace_period, "gracePeriod")
+            validation_error = _validate_resource_name(pod, "pod")
             if validation_error:
                 return validation_error
-            cmd.extend([f"--grace-period={grace_period}"])
+            validation_error = _validate_resource_name(namespace, "namespace")
+            if validation_error:
+                return validation_error
 
-        logger.info("Deleting pod %s in namespace %s", pod, namespace)
-        return await self._run_kubectl(cmd, timeout=timeout)
+            cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+            cmd.extend(["delete", "pod", pod, "-n", namespace])
+
+            if grace_period is not None:
+                grace_period, validation_error = _validate_positive_int(grace_period, "gracePeriod")
+                if validation_error:
+                    return validation_error
+                cmd.extend([f"--grace-period={grace_period}"])
+
+            logger.info("Deleting pod %s in namespace %s", pod, namespace)
+            return await self._run_kubectl(cmd, timeout=timeout)
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)
 
     async def _rollback_deployment(
         self, connection_id: str | None, params: dict[str, Any]
@@ -450,130 +606,440 @@ class KubernetesExecutor(BaseExecutor):
 
         Args:
             connection_id: Connection ID for kubeconfig lookup.
-            params: Must contain 'deployment'. Optional: 'namespace', 'timeout', 'revision'.
+            params: Must contain 'deployment'. Optional: 'namespace', 'context', 'timeout', 'revision'.
 
         Returns:
             Result dict.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        deployment = params.get("deployment", "")
-        namespace = params.get("namespace", "default")
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
-        revision = params.get("revision")
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, namespace = self._resolve_connection_params(params)
+            deployment = params.get("deployment", "")
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+            revision = params.get("revision")
 
-        if not deployment:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Deployment name is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
+            if not deployment:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Deployment name is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
 
-        validation_error = _validate_resource_name(deployment, "deployment")
-        if validation_error:
-            return validation_error
-        validation_error = _validate_resource_name(namespace, "namespace")
-        if validation_error:
-            return validation_error
-
-        cmd = self._build_base_cmd(kubeconfig)
-        cmd.extend([
-            "rollout", "undo", f"deployment/{deployment}",
-            "-n", namespace,
-        ])
-
-        if revision is not None:
-            revision, validation_error = _validate_positive_int(revision, "revision")
+            validation_error = _validate_resource_name(deployment, "deployment")
             if validation_error:
                 return validation_error
-            cmd.extend([f"--to-revision={revision}"])
+            validation_error = _validate_resource_name(namespace, "namespace")
+            if validation_error:
+                return validation_error
 
-        logger.info("Rolling back deployment %s in namespace %s", deployment, namespace)
-        return await self._run_kubectl(cmd, timeout=timeout)
+            cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+            cmd.extend([
+                "rollout", "undo", f"deployment/{deployment}",
+                "-n", namespace,
+            ])
 
-    async def _get_logs(
-        self, connection_id: str | None, params: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Retrieve logs from a Kubernetes pod.
+            if revision is not None:
+                revision, validation_error = _validate_positive_int(revision, "revision")
+                if validation_error:
+                    return validation_error
+                cmd.extend([f"--to-revision={revision}"])
+
+            logger.info("Rolling back deployment %s in namespace %s", deployment, namespace)
+            return await self._run_kubectl(cmd, timeout=timeout)
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)
+
+    async def _list_pods(
+        self,
+        kubeconfig: str | None,
+        context: str | None,
+        namespace: str,
+        is_temp: bool,
+        timeout: int,
+        label_selector: str | None = None,
+    ) -> tuple[list[str] | None, dict[str, Any] | None]:
+        """List pod names in a namespace, optionally filtered by label selector.
 
         Args:
-            connection_id: Connection ID for kubeconfig lookup.
-            params: Must contain 'pod'. Optional: 'namespace', 'container',
-                    'tailLines', 'sinceSeconds', 'timeout'.
+            kubeconfig: Path to kubeconfig file.
+            context: Kubernetes context.
+            namespace: Target namespace.
+            is_temp: Whether kubeconfig is a temp file.
+            timeout: Command timeout in seconds.
+            label_selector: Optional label selector (e.g. 'app=ec-ui').
+
+        Returns:
+            Tuple of (pod_name_list, None) on success, or (None, error_dict) on failure.
+        """
+        cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+        cmd.extend(["get", "pods", "-n", namespace, "-o", "name"])
+        if label_selector:
+            cmd.extend(["-l", label_selector])
+
+        result = await self._run_kubectl(cmd, timeout=timeout)
+        if result["status"] != "success":
+            return None, result
+
+        output = result.get("output", "")
+        raw_text = output if isinstance(output, str) else output.get("stdout", "") if isinstance(output, dict) else ""
+        # kubectl output: "pod/name-xxx\npod/name-yyy\n"
+        pod_names = []
+        for line in raw_text.strip().splitlines():
+            line = line.strip()
+            if line:
+                # Strip "pod/" prefix
+                pod_names.append(line.removeprefix("pod/"))
+        return pod_names, None
+
+    async def _get_logs_for_single_pod(
+        self,
+        kubeconfig: str | None,
+        context: str | None,
+        namespace: str,
+        pod: str,
+        container: str | None,
+        tail_lines: int | None,
+        since_seconds: int | None,
+        is_temp: bool,
+        timeout: int,
+    ) -> dict[str, Any]:
+        """Retrieve logs from a single Kubernetes pod.
+
+        Args:
+            kubeconfig: Path to kubeconfig file.
+            context: Kubernetes context.
+            namespace: Target namespace.
+            pod: Pod name.
+            container: Optional container name.
+            tail_lines: Optional number of tail lines.
+            since_seconds: Optional since duration in seconds.
+            is_temp: Whether kubeconfig is a temp file.
+            timeout: Command timeout in seconds.
 
         Returns:
             Result dict with log output.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        pod = params.get("pod", "")
-        namespace = params.get("namespace", "default")
-        container = params.get("container")
-        tail_lines = params.get("tailLines")
-        since_seconds = params.get("sinceSeconds")
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
-
-        if not pod:
-            return {
-                "status": "error",
-                "output": None,
-                "error": "Pod name is required",
-                "exitCode": -1,
-                "durationMs": 0,
-            }
-
-        validation_error = _validate_resource_name(pod, "pod")
-        if validation_error:
-            return validation_error
-        validation_error = _validate_resource_name(namespace, "namespace")
-        if validation_error:
-            return validation_error
-        if container:
-            validation_error = _validate_resource_name(container, "container")
-            if validation_error:
-                return validation_error
-
-        cmd = self._build_base_cmd(kubeconfig)
+        cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
         cmd.extend(["logs", pod, "-n", namespace])
 
         if container:
             cmd.extend(["-c", container])
         if tail_lines is not None:
-            tail_lines, validation_error = _validate_positive_int(tail_lines, "tailLines")
-            if validation_error:
-                return validation_error
             cmd.extend([f"--tail={tail_lines}"])
         if since_seconds is not None:
-            since_seconds, validation_error = _validate_positive_int(since_seconds, "sinceSeconds")
-            if validation_error:
-                return validation_error
             cmd.extend([f"--since={since_seconds}s"])
 
-        logger.info("Getting logs for pod %s in namespace %s", pod, namespace)
         return await self._run_kubectl(cmd, timeout=timeout)
+
+    async def _get_logs_multi(
+        self,
+        kubeconfig: str | None,
+        context: str | None,
+        namespace: str,
+        pod_names: list[str],
+        container: str | None,
+        tail_lines: int | None,
+        since_seconds: int | None,
+        is_temp: bool,
+        timeout: int,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Retrieve logs from multiple pods in parallel with a concurrency semaphore.
+
+        Args:
+            kubeconfig: Path to kubeconfig file.
+            context: Kubernetes context.
+            namespace: Target namespace.
+            pod_names: List of pod names to fetch logs from.
+            container: Optional container name.
+            tail_lines: Optional number of tail lines.
+            since_seconds: Optional since duration in seconds.
+            is_temp: Whether kubeconfig is a temp file.
+            timeout: Command timeout in seconds.
+            mode: 'regex' or 'selector' (for output metadata).
+
+        Returns:
+            Result dict with multi-pod output format.
+        """
+        start = time.monotonic_ns()
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_LOG_FETCHES)
+
+        async def fetch_one(pod_name: str) -> dict[str, Any]:
+            async with semaphore:
+                result = await self._get_logs_for_single_pod(
+                    kubeconfig, context, namespace, pod_name,
+                    container, tail_lines, since_seconds, is_temp, timeout,
+                )
+                output = result.get("output", "")
+                if isinstance(output, dict):
+                    logs_text = output.get("stdout", "")
+                else:
+                    logs_text = output or ""
+                return {
+                    "name": pod_name,
+                    "logs": logs_text,
+                    "error": result.get("error"),
+                }
+
+        pod_results = await asyncio.gather(
+            *(fetch_one(name) for name in pod_names),
+            return_exceptions=True,
+        )
+
+        duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
+
+        pods_output = []
+        has_error = False
+        for i, res in enumerate(pod_results):
+            if isinstance(res, Exception):
+                has_error = True
+                pods_output.append({
+                    "name": pod_names[i],
+                    "logs": "",
+                    "error": str(res),
+                })
+            else:
+                if res.get("error"):
+                    has_error = True
+                pods_output.append(res)
+
+        all_failed = has_error and all(p.get("error") for p in pods_output)
+        partial_failure = has_error and not all_failed
+
+        if all_failed:
+            status = "error"
+            error_msg = "All pod log fetches failed"
+            exit_code = 1
+        elif partial_failure:
+            failed_pods = [p["name"] for p in pods_output if p.get("error")]
+            status = "success"
+            error_msg = f"Partial failure: logs unavailable for pod(s): {', '.join(failed_pods)}"
+            exit_code = 0
+        else:
+            status = "success"
+            error_msg = None
+            exit_code = 0
+
+        return {
+            "status": status,
+            "output": {
+                "pods": pods_output,
+                "matchedCount": len(pod_names),
+                "mode": mode,
+                "partialFailure": partial_failure,
+            },
+            "error": error_msg,
+            "exitCode": exit_code,
+            "durationMs": duration_ms,
+        }
+
+    async def _get_logs(
+        self, connection_id: str | None, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Retrieve logs from Kubernetes pods. Supports three modes:
+
+        - Exact: single pod by name (``pod`` param)
+        - Regex: multiple pods matching a pattern (``podPattern`` param)
+        - Label selector: multiple pods matching a selector (``selector`` param)
+
+        Exactly one of ``pod``, ``podPattern``, or ``selector`` must be provided.
+
+        Args:
+            connection_id: Connection ID for kubeconfig lookup.
+            params: Must contain exactly one of 'pod', 'podPattern', 'selector'.
+                    Optional: 'namespace', 'context', 'container', 'tailLines',
+                    'sinceSeconds', 'timeout'.
+
+        Returns:
+            Result dict with log output.
+        """
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, namespace = self._resolve_connection_params(params)
+            pod = params.get("pod", "").strip() if params.get("pod") else ""
+            pod_pattern = params.get("podPattern", "").strip() if params.get("podPattern") else ""
+            selector = params.get("selector", "").strip() if params.get("selector") else ""
+            container = params.get("container")
+            tail_lines = params.get("tailLines")
+            since_seconds = params.get("sinceSeconds")
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+
+            # Exactly one mode must be specified
+            mode_count = sum(1 for v in [pod, pod_pattern, selector] if v)
+            if mode_count == 0:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "One of 'pod', 'podPattern', or 'selector' is required",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
+            if mode_count > 1:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": "Only one of 'pod', 'podPattern', or 'selector' may be specified",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
+
+            # Validate namespace
+            validation_error = _validate_resource_name(namespace, "namespace")
+            if validation_error:
+                return validation_error
+
+            # Validate optional container
+            if container:
+                validation_error = _validate_resource_name(container, "container")
+                if validation_error:
+                    return validation_error
+
+            # Validate optional numeric params
+            if tail_lines is not None:
+                tail_lines, validation_error = _validate_positive_int(tail_lines, "tailLines")
+                if validation_error:
+                    return validation_error
+            if since_seconds is not None:
+                since_seconds, validation_error = _validate_positive_int(since_seconds, "sinceSeconds")
+                if validation_error:
+                    return validation_error
+
+            # --- Exact mode (backward compatible) ---
+            if pod:
+                validation_error = _validate_resource_name(pod, "pod")
+                if validation_error:
+                    return validation_error
+
+                logger.info("Getting logs for pod %s in namespace %s", pod, namespace)
+                return await self._get_logs_for_single_pod(
+                    kubeconfig, context, namespace, pod,
+                    container, tail_lines, since_seconds, is_temp, timeout,
+                )
+
+            # --- Regex mode ---
+            if pod_pattern:
+                compiled, validation_error = _validate_regex_pattern(pod_pattern)
+                if validation_error:
+                    return validation_error
+
+                logger.info("Listing pods in namespace %s for pattern %s", namespace, pod_pattern)
+                all_pods, list_error = await self._list_pods(
+                    kubeconfig, context, namespace, is_temp, timeout,
+                )
+                if list_error:
+                    return list_error
+
+                matched = [p for p in all_pods if compiled.search(p)]
+
+                if not matched:
+                    return {
+                        "status": "error",
+                        "output": None,
+                        "error": f"No pods matched pattern '{pod_pattern}' in namespace '{namespace}'",
+                        "exitCode": -1,
+                        "durationMs": 0,
+                    }
+                if len(matched) > MAX_MULTI_POD_LOGS:
+                    return {
+                        "status": "error",
+                        "output": None,
+                        "error": (
+                            f"Pattern '{pod_pattern}' matched {len(matched)} pods, "
+                            f"exceeding limit of {MAX_MULTI_POD_LOGS}. Narrow your pattern."
+                        ),
+                        "exitCode": -1,
+                        "durationMs": 0,
+                    }
+
+                logger.info(
+                    "Fetching logs for %d pods matching '%s' in namespace %s",
+                    len(matched), pod_pattern, namespace,
+                )
+                return await self._get_logs_multi(
+                    kubeconfig, context, namespace, matched,
+                    container, tail_lines, since_seconds, is_temp, timeout,
+                    mode="regex",
+                )
+
+            # --- Label selector mode ---
+            validation_error = _validate_label_selector(selector)
+            if validation_error:
+                return validation_error
+
+            logger.info("Listing pods with selector '%s' in namespace %s", selector, namespace)
+            matched_pods, list_error = await self._list_pods(
+                kubeconfig, context, namespace, is_temp, timeout,
+                label_selector=selector,
+            )
+            if list_error:
+                return list_error
+
+            if not matched_pods:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": f"No pods matched selector '{selector}' in namespace '{namespace}'",
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
+            if len(matched_pods) > MAX_MULTI_POD_LOGS:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": (
+                        f"Selector '{selector}' matched {len(matched_pods)} pods, "
+                        f"exceeding limit of {MAX_MULTI_POD_LOGS}. Narrow your selector."
+                    ),
+                    "exitCode": -1,
+                    "durationMs": 0,
+                }
+
+            logger.info(
+                "Fetching logs for %d pods with selector '%s' in namespace %s",
+                len(matched_pods), selector, namespace,
+            )
+            return await self._get_logs_multi(
+                kubeconfig, context, namespace, matched_pods,
+                container, tail_lines, since_seconds, is_temp, timeout,
+                mode="selector",
+            )
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)
 
     async def _test_connection(
         self, connection_id: str | None, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Test Kubernetes connectivity by running 'kubectl version --short'.
+        """Test Kubernetes connectivity by running 'kubectl cluster-info'.
 
         Args:
             connection_id: Connection ID for kubeconfig lookup.
-            params: Optional 'timeout'.
+            params: Optional 'context', 'connectionConfig', 'timeout'.
 
         Returns:
             Result dict indicating cluster connectivity.
         """
-        kubeconfig = self._get_kubeconfig_path(connection_id)
-        timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
+        kubeconfig, is_temp = self._resolve_kubeconfig(connection_id)
+        try:
+            context, _ = self._resolve_connection_params(params)
+            timeout = params.get("timeout", DEFAULT_K8S_TIMEOUT)
 
-        cmd = self._build_base_cmd(kubeconfig)
-        cmd.extend(["version", "--client", "-o", "json"])
+            cmd = self._build_base_cmd(kubeconfig, context=context, is_temp=is_temp)
+            cmd.extend(["cluster-info"])
 
-        logger.info("Testing Kubernetes connection")
-        result = await self._run_kubectl(cmd, timeout=timeout)
+            logger.info("Testing Kubernetes connection")
+            result = await self._run_kubectl(cmd, timeout=timeout)
 
-        if result["status"] == "success":
-            result["output"]["message"] = "Kubernetes connection successful"
+            if result["status"] == "success":
+                if isinstance(result["output"], dict):
+                    result["output"]["message"] = "Kubernetes connection successful"
+                else:
+                    result["output"] = {
+                        "message": "Kubernetes connection successful",
+                        "clusterInfo": result["output"],
+                    }
 
-        return result
+            return result
+        finally:
+            self._cleanup_temp_kubeconfig(kubeconfig, is_temp)

@@ -16,6 +16,7 @@ logger = logging.getLogger("ec-im-agent.executors.script")
 
 DEFAULT_SCRIPT_TIMEOUT = 300  # 5 minutes
 MAX_OUTPUT_SIZE = 1_048_576  # 1 MB
+MAX_SCRIPT_CONTENT_BYTES = 1 * 1024 * 1024  # 1 MB
 
 # M5: Use a dedicated temp directory under the agent's data directory
 # instead of the system /tmp to reduce risk of temp file attacks.
@@ -111,6 +112,19 @@ class ScriptExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        # Validate script content size to prevent memory exhaustion
+        if isinstance(script, str):
+            content_bytes = len(script.encode("utf-8"))
+            if content_bytes > MAX_SCRIPT_CONTENT_BYTES:
+                return {
+                    "status": "error",
+                    "output": None,
+                    "error": f"Script content exceeds maximum size ({content_bytes} bytes > {MAX_SCRIPT_CONTENT_BYTES} bytes)",
+                    "exitCode": 1,
+                    "durationMs": 0,
+                }
+
         timeout = params.get("timeout", DEFAULT_SCRIPT_TIMEOUT)
         extra_env = params.get("env", {})
         script_args = params.get("args", [])

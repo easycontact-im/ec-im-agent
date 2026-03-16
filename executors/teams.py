@@ -72,20 +72,61 @@ class TeamsExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-    def _get_webhook_url(self, connection_id: str | None) -> str | None:
-        """Get Teams webhook URL from vault.
+    def _get_webhook_url(self, connection_id: str | None, params: dict[str, Any] | None = None) -> str | None:
+        """Get Teams webhook URL from vault or connection config.
+
+        Checks the vault first (credential data), then falls back to
+        connectionConfig in job params (since Teams stores webhookUrl
+        in config, not credentials).
 
         Args:
             connection_id: Connection ID for vault lookup.
+            params: Job params that may contain connectionConfig.
 
         Returns:
             The webhook URL string, or None if not found.
         """
-        if not connection_id:
-            return None
-        cred = self.vault.get_credential(connection_id)
-        if cred:
-            return cred.get("webhookUrl")
+        # Try vault first
+        if connection_id:
+            cred = self.vault.get_credential(connection_id)
+            if cred:
+                url = cred.get("webhookUrl")
+                if url:
+                    return url
+
+        if params:
+            # Fall back to connectionConfig in params (test jobs)
+            config = params.get("connectionConfig", {})
+            if isinstance(config, dict):
+                url = config.get("webhookUrl")
+                if url:
+                    return url
+
+            # Fall back to webhookUrl directly in params (workflow jobs)
+            url = params.get("webhookUrl")
+            if url:
+                return url
+
+        return None
+
+    @staticmethod
+    def _validate_webhook_url(webhook_url: str) -> dict[str, Any] | None:
+        """Validate that the Teams webhook URL uses HTTPS.
+
+        Args:
+            webhook_url: The webhook URL to validate.
+
+        Returns:
+            An error result dict if the URL does not use HTTPS, or None if valid.
+        """
+        if not webhook_url.startswith("https://"):
+            return {
+                "status": "error",
+                "output": None,
+                "error": "Teams webhook URL must use HTTPS. Received URL does not start with 'https://'.",
+                "exitCode": -1,
+                "durationMs": 0,
+            }
         return None
 
     async def _send_message(
@@ -100,7 +141,7 @@ class TeamsExecutor(BaseExecutor):
         Returns:
             Result dict confirming the message was posted.
         """
-        webhook_url = self._get_webhook_url(connection_id)
+        webhook_url = self._get_webhook_url(connection_id, params)
         if not webhook_url:
             return {
                 "status": "error",
@@ -109,6 +150,10 @@ class TeamsExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        url_error = self._validate_webhook_url(webhook_url)
+        if url_error:
+            return url_error
 
         message = params.get("message", "")
         title = params.get("title", "")
@@ -204,7 +249,7 @@ class TeamsExecutor(BaseExecutor):
         Returns:
             Result dict confirming the card was posted.
         """
-        webhook_url = self._get_webhook_url(connection_id)
+        webhook_url = self._get_webhook_url(connection_id, params)
         if not webhook_url:
             return {
                 "status": "error",
@@ -213,6 +258,10 @@ class TeamsExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        url_error = self._validate_webhook_url(webhook_url)
+        if url_error:
+            return url_error
 
         card_json = params.get("cardJson")
         if not card_json:
@@ -316,7 +365,7 @@ class TeamsExecutor(BaseExecutor):
         Returns:
             Result dict confirming the webhook is reachable.
         """
-        webhook_url = self._get_webhook_url(connection_id)
+        webhook_url = self._get_webhook_url(connection_id, params)
         if not webhook_url:
             return {
                 "status": "error",
@@ -325,6 +374,10 @@ class TeamsExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        url_error = self._validate_webhook_url(webhook_url)
+        if url_error:
+            return url_error
 
         start = time.monotonic_ns()
         try:

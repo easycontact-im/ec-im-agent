@@ -259,7 +259,7 @@ class SlackExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Slack sendMessage failed for connection %s: %s", connection_id, exc)
+            logger.error("Slack sendMessage failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -344,7 +344,7 @@ class SlackExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Slack updateMessage failed for connection %s: %s", connection_id, exc)
+            logger.error("Slack updateMessage failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -428,7 +428,7 @@ class SlackExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Slack addReaction failed for connection %s: %s", connection_id, exc)
+            logger.error("Slack addReaction failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,
@@ -498,7 +498,7 @@ class SlackExecutor(BaseExecutor):
             }
         except Exception as exc:
             duration_ms = int((time.monotonic_ns() - start) / 1_000_000)
-            logger.error("Slack testConnection failed for connection %s: %s", connection_id, exc)
+            logger.error("Slack testConnection failed for connection %s: %s", connection_id, type(exc).__name__)
             return {
                 "status": "error",
                 "output": None,

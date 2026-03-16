@@ -12,7 +12,7 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
 
-RUN uv sync --no-dev --no-install-project
+RUN uv sync --no-dev --no-install-project --extra database
 
 COPY . .
 

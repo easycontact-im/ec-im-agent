@@ -16,6 +16,8 @@ from executors.slack import SlackExecutor
 from executors.jira import JiraExecutor
 from executors.email import EmailExecutor
 from executors.teams import TeamsExecutor
+from executors.database import DatabaseExecutor
+from executors.winrm import WinRMExecutor
 
 EXECUTOR_REGISTRY: dict[str, type[BaseExecutor]] = {
     "ssh": SSHExecutor,
@@ -28,6 +30,8 @@ EXECUTOR_REGISTRY: dict[str, type[BaseExecutor]] = {
     "jira": JiraExecutor,
     "email": EmailExecutor,
     "teams": TeamsExecutor,
+    "database": DatabaseExecutor,
+    "winrm": WinRMExecutor,
 }
 
 __all__ = [
@@ -42,5 +46,7 @@ __all__ = [
     "JiraExecutor",
     "EmailExecutor",
     "TeamsExecutor",
+    "DatabaseExecutor",
+    "WinRMExecutor",
     "EXECUTOR_REGISTRY",
 ]

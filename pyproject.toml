@@ -12,9 +12,14 @@ dependencies = [
     "aiohttp>=3.10",
     "aiosmtplib>=3.0",
     "psutil>=6.0",
+    "pywinrm>=0.4",
 ]
 
 [project.optional-dependencies]
+database = [
+    "asyncpg>=0.30",
+    "aiomysql>=0.2",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
