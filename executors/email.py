@@ -1,5 +1,6 @@
 """Email executor for sending emails via SMTP."""
 
+import json
 import logging
 import time
 from email.mime.multipart import MIMEMultipart
@@ -9,6 +10,7 @@ from typing import Any
 import aiosmtplib
 
 from executors.base import BaseExecutor
+from formatters import format_output, FormatContext
 
 logger = logging.getLogger("ec-im-agent.executors.email")
 
@@ -160,6 +162,37 @@ class EmailExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+
+        # Rich formatting: auto-generate branded HTML from output data
+        message_format = params.get("messageFormat", "plain")
+        if message_format == "rich":
+            output_data = params.get("outputData")
+            if output_data:
+                if isinstance(output_data, str):
+                    try:
+                        output_data = json.loads(output_data)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                ctx = FormatContext(
+                    title=params.get("title", subject),
+                    source_action=params.get("sourceAction", ""),
+                    node_name=params.get("nodeName", ""),
+                    workflow_name=params.get("workflowName", ""),
+                    incident_url=params.get("incidentUrl", ""),
+                    severity=params.get("severity", ""),
+                    status=params.get("status", ""),
+                    timestamp=params.get("timestamp", ""),
+                )
+                result = format_output(
+                    channel="email",
+                    output=output_data,
+                    context=ctx,
+                    action_type=params.get("sourceAction", ""),
+                    output_type_hint=params.get("outputType", ""),
+                )
+                html_body = result.get("html", html_body)
+                if not body:
+                    body = result.get("text", "")
 
         if not body and not html_body:
             return {

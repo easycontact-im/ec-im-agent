@@ -1,6 +1,7 @@
 """Slack executor for sending messages, updating messages, and adding reactions."""
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import httpx
 
 from executors.base import BaseExecutor
+from formatters import format_output, FormatContext
 
 logger = logging.getLogger("ec-im-agent.executors.slack")
 
@@ -195,9 +197,18 @@ class SlackExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-        channel = params.get("channel", "")
+        channel = params.get("channel", "").lstrip("#")
         message = params.get("message", "")
-        if not channel or not message:
+        message_format = params.get("messageFormat", "plain")
+        if not channel:
+            return {
+                "status": "error",
+                "output": None,
+                "error": "'channel' is required",
+                "exitCode": -1,
+                "durationMs": 0,
+            }
+        if not message and message_format != "rich":
             return {
                 "status": "error",
                 "output": None,
@@ -218,7 +229,37 @@ class SlackExecutor(BaseExecutor):
             if thread_ts:
                 payload["thread_ts"] = thread_ts
 
-            # Optional: blocks for rich formatting
+            # Rich formatting: auto-generate Block Kit from output data
+            if message_format == "rich":
+                output_data = params.get("outputData")
+                if output_data:
+                    # Parse JSON string if needed
+                    if isinstance(output_data, str):
+                        try:
+                            output_data = json.loads(output_data)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    ctx = FormatContext(
+                        title=params.get("title", ""),
+                        source_action=params.get("sourceAction", ""),
+                        node_name=params.get("nodeName", ""),
+                        workflow_name=params.get("workflowName", ""),
+                        incident_url=params.get("incidentUrl", ""),
+                        severity=params.get("severity", ""),
+                        status=params.get("status", ""),
+                        timestamp=params.get("timestamp", ""),
+                    )
+                    result = format_output(
+                        channel="slack",
+                        output=output_data,
+                        context=ctx,
+                        action_type=params.get("sourceAction", ""),
+                        output_type_hint=params.get("outputType", ""),
+                    )
+                    payload["blocks"] = result.get("blocks", [])
+                    payload["text"] = result.get("text", message)
+
+            # Optional: blocks for rich formatting (manual override)
             blocks = params.get("blocks")
             if blocks:
                 payload["blocks"] = blocks
@@ -290,7 +331,7 @@ class SlackExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-        channel = params.get("channel", "")
+        channel = params.get("channel", "").lstrip("#")
         ts = params.get("ts", "")
         message = params.get("message", "")
         if not channel or not ts or not message:
@@ -375,7 +416,7 @@ class SlackExecutor(BaseExecutor):
                 "durationMs": 0,
             }
 
-        channel = params.get("channel", "")
+        channel = params.get("channel", "").lstrip("#")
         ts = params.get("ts", "")
         emoji = params.get("emoji", "")
         if not channel or not ts or not emoji:

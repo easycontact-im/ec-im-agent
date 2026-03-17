@@ -1,5 +1,6 @@
 """Microsoft Teams executor for sending messages via Incoming Webhooks and Workflows."""
 
+import json
 import logging
 import time
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import httpx
 
 from executors.base import BaseExecutor
+from formatters import format_output, FormatContext
 
 logger = logging.getLogger("ec-im-agent.executors.teams")
 
@@ -158,8 +160,9 @@ class TeamsExecutor(BaseExecutor):
         message = params.get("message", "")
         title = params.get("title", "")
         theme_color = params.get("themeColor", "0076D7")
+        message_format = params.get("messageFormat", "plain")
 
-        if not message:
+        if not message and message_format != "rich":
             return {
                 "status": "error",
                 "output": None,
@@ -167,11 +170,48 @@ class TeamsExecutor(BaseExecutor):
                 "exitCode": -1,
                 "durationMs": 0,
             }
+        rich_card: dict | None = None
+        if message_format == "rich":
+            output_data = params.get("outputData")
+            if output_data:
+                if isinstance(output_data, str):
+                    try:
+                        output_data = json.loads(output_data)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                ctx = FormatContext(
+                    title=params.get("title", title),
+                    source_action=params.get("sourceAction", ""),
+                    node_name=params.get("nodeName", ""),
+                    workflow_name=params.get("workflowName", ""),
+                    incident_url=params.get("incidentUrl", ""),
+                    severity=params.get("severity", ""),
+                    status=params.get("status", ""),
+                    timestamp=params.get("timestamp", ""),
+                )
+                result = format_output(
+                    channel="teams",
+                    output=output_data,
+                    context=ctx,
+                    action_type=params.get("sourceAction", ""),
+                    output_type_hint=params.get("outputType", ""),
+                )
+                rich_card = result.get("card")
 
         start = time.monotonic_ns()
         try:
-            # Detect webhook type: Power Automate Workflows vs legacy connectors
-            if "/workflows/" in webhook_url:
+            if rich_card:
+                # Use the formatter-generated Adaptive Card
+                payload = {
+                    "type": "message",
+                    "attachments": [
+                        {
+                            "contentType": "application/vnd.microsoft.card.adaptive",
+                            "content": rich_card,
+                        }
+                    ],
+                }
+            elif "/workflows/" in webhook_url:
                 # Power Automate Workflows (new) — expects Adaptive Card payload
                 payload = _build_adaptive_card_payload(title, message, theme_color)
             else:
