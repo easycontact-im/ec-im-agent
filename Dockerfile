@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder - install dependencies
 # ============================================================
-FROM python:3.12-alpine AS builder
+FROM python:3.13-alpine AS builder
 
 # Build tools for C/C++ extensions (cryptography, asyncssh, etc.)
 RUN apk add --no-cache build-base libffi-dev openssl-dev curl
@@ -29,7 +29,7 @@ RUN ARCH=$(uname -m) && \
 # ============================================================
 # Stage 2: Runtime - minimal production image
 # ============================================================
-FROM python:3.12-alpine
+FROM python:3.13-alpine
 
 # Runtime libraries: openssh-client for SSH, kubectl for k8s
 RUN apk add --no-cache openssh-client libstdc++ libffi
