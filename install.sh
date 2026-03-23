@@ -139,24 +139,10 @@ fi
 # ── Step 1: System dependencies ──────────────────────────────
 info "[1/7] Checking system dependencies..."
 
-# Check Python 3.12+
-if command -v python3 &>/dev/null; then
-    PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
-    PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+REQUIRED_PY_MINOR=13
+PYTHON_BIN=""
 
-    if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 12 ]]; then
-        error "Python 3.12+ is required (found $PY_VERSION). Install python3.12 or newer."
-    fi
-    success "Python $PY_VERSION found"
-else
-    info "Installing Python 3..."
-    apt-get update -qq
-    apt-get install -y -qq python3 python3-venv > /dev/null
-    success "Python 3 installed"
-fi
-
-# Ensure curl and other basics
+# Ensure curl, tar, and python3-venv basics
 for cmd in curl tar; do
     if ! command -v "$cmd" &>/dev/null; then
         info "Installing $cmd..."
@@ -165,24 +151,53 @@ for cmd in curl tar; do
     fi
 done
 
-success "System dependencies OK"
+# Find a suitable Python >= 3.13
+# Check python3.13, python3.14, python3.15 first (deadsnakes), then python3
+for candidate in python3.13 python3.14 python3.15 python3; do
+    if command -v "$candidate" &>/dev/null; then
+        CAND_MAJOR=$($candidate -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo 0)
+        CAND_MINOR=$($candidate -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo 0)
+        if [[ "$CAND_MAJOR" -ge 3 ]] && [[ "$CAND_MINOR" -ge "$REQUIRED_PY_MINOR" ]]; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    fi
+done
 
-# ── Step 2: Install uv ──────────────────────────────────────
-info "[2/7] Checking uv package manager..."
+if [[ -n "$PYTHON_BIN" ]]; then
+    PY_VERSION=$($PYTHON_BIN --version 2>&1 | awk '{print $2}')
+    success "Python $PY_VERSION found ($PYTHON_BIN)"
+else
+    # Try to install Python 3.13 via deadsnakes PPA (Ubuntu)
+    info "Python 3.${REQUIRED_PY_MINOR}+ not found. Installing via deadsnakes PPA..."
+    if command -v add-apt-repository &>/dev/null; then
+        add-apt-repository -y ppa:deadsnakes/ppa > /dev/null 2>&1
+        apt-get update -qq
+        apt-get install -y -qq "python3.${REQUIRED_PY_MINOR}" "python3.${REQUIRED_PY_MINOR}-venv" > /dev/null
+        PYTHON_BIN="python3.${REQUIRED_PY_MINOR}"
 
-if ! command -v uv &>/dev/null; then
-    info "Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null
-    # uv installs to ~/.local/bin (for root that's /root/.local/bin)
-    export PATH="/root/.local/bin:$PATH"
-
-    if ! command -v uv &>/dev/null; then
-        error "Failed to install uv. Please install manually: https://docs.astral.sh/uv/"
+        if ! command -v "$PYTHON_BIN" &>/dev/null; then
+            error "Failed to install Python 3.${REQUIRED_PY_MINOR}. Install manually: sudo apt install python3.${REQUIRED_PY_MINOR} python3.${REQUIRED_PY_MINOR}-venv"
+        fi
+        PY_VERSION=$($PYTHON_BIN --version 2>&1 | awk '{print $2}')
+        success "Python $PY_VERSION installed via deadsnakes"
+    else
+        error "Python 3.${REQUIRED_PY_MINOR}+ is required. Install manually: sudo apt install software-properties-common && sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt install python3.${REQUIRED_PY_MINOR} python3.${REQUIRED_PY_MINOR}-venv"
     fi
 fi
 
-UV_VERSION=$(uv --version 2>/dev/null | head -1)
-success "uv ready ($UV_VERSION)"
+# Ensure python3-venv module is available for the chosen Python
+if ! $PYTHON_BIN -m venv --help &>/dev/null 2>&1; then
+    info "Installing venv module for $PYTHON_BIN..."
+    PY_PKG_NAME=$(basename "$PYTHON_BIN")
+    apt-get install -y -qq "${PY_PKG_NAME}-venv" > /dev/null 2>&1 || true
+fi
+
+success "System dependencies OK"
+
+# ── Step 2: Reserved (uv no longer required) ─────────────────
+info "[2/7] Skipping package manager (using pip)..."
+success "Using $PYTHON_BIN with pip"
 
 # ── Step 3: Create service user ──────────────────────────────
 info "[3/7] Setting up service user..."
@@ -249,12 +264,34 @@ success "Agent $VERSION downloaded and extracted"
 info "[5/7] Installing Python dependencies..."
 
 cd "$INSTALL_DIR"
-if ! uv sync --no-dev --no-install-project 2>&1 | tail -5; then
-    error "uv sync failed. Check dependencies in pyproject.toml."
+
+# Create venv as the service user (avoids /root symlink issues)
+chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
+
+if [ -d ".venv" ]; then
+    info "Removing existing venv..."
+    rm -rf .venv
 fi
 
-# Set ownership
-chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
+info "Creating virtual environment with $PYTHON_BIN..."
+sudo -u "$SERVICE_USER" "$PYTHON_BIN" -m venv .venv
+
+info "Installing dependencies..."
+sudo -u "$SERVICE_USER" .venv/bin/pip install --quiet --disable-pip-version-check \
+    "httpx>=0.27" \
+    "pydantic>=2.0" \
+    "pydantic-settings>=2.0" \
+    "cryptography>=43.0" \
+    "asyncssh>=2.17" \
+    "aiohttp>=3.10" \
+    "aiosmtplib>=3.0" \
+    "psutil>=6.0" \
+    "pywinrm>=0.4"
+
+# Verify the venv works as the service user
+if ! sudo -u "$SERVICE_USER" .venv/bin/python -c "import httpx, pydantic; print('OK')" &>/dev/null; then
+    error "Virtual environment verification failed. Dependencies may not be installed correctly."
+fi
 
 success "Dependencies installed"
 
