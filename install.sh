@@ -195,9 +195,23 @@ fi
 
 success "System dependencies OK"
 
-# ── Step 2: Reserved (uv no longer required) ─────────────────
-info "[2/7] Skipping package manager (using pip)..."
-success "Using $PYTHON_BIN with pip"
+# ── Step 2: Install kubectl (for Kubernetes executor) ─────────
+info "[2/7] Checking kubectl..."
+
+if command -v kubectl &>/dev/null; then
+    success "kubectl already installed ($(kubectl version --client --short 2>/dev/null || echo 'found'))"
+else
+    info "Installing kubectl..."
+    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt 2>/dev/null)
+    if [[ -n "$KUBECTL_VERSION" ]]; then
+        curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+        rm -f /tmp/kubectl
+        success "kubectl $KUBECTL_VERSION installed"
+    else
+        warn "Could not install kubectl (no network access to dl.k8s.io). Kubernetes executor will not work."
+    fi
+fi
 
 # ── Step 3: Create service user ──────────────────────────────
 info "[3/7] Setting up service user..."
